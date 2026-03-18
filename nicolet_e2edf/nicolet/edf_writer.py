@@ -267,18 +267,24 @@ def _calculate_max_annotation_samples(
 
 def write_edf(
     output_path: str | Path,
-    data_uV: np.ndarray,
-    sfreq: float,
+    data_uV: np.ndarray | Sequence[np.ndarray],
+    sfreq: float | Sequence[float],
     ch_names: Sequence[str],
     patient_meta: dict[str, str] | None = None,
     recording_start: datetime | None = None,
     annotations: Sequence[EventItem] | None = None,
 ) -> Path:
     """Write an EDF+ compatible file from microvolt data.
-    
+
+    Supports both uniform and mixed sampling rates:
+    - Uniform: pass a 2D array [samples, channels] and a single float sfreq.
+    - Mixed:   pass a list of 1D arrays (one per channel) and a list of floats
+               (one sampling rate per channel). Each signal is stored at its
+               native rate; no upsampling is performed.
+
     Outputs files compliant with the EDF+ specification:
     https://www.edfplus.info/specs/edfplus.html
-    
+
     Key EDF+ compliance features:
     - Uses 1-second data records to stay well under size limits
     - Reserved field starts with 'EDF+C' (continuous recording)
@@ -286,36 +292,59 @@ def write_edf(
     - Recording identification starts with 'Startdate DD-MMM-YYYY'
     - EDF Annotations signal for events with time-keeping TAL per record
     """
-    if data_uV.ndim != 2:
-        raise ValueError("EDF writer expects data shaped as [samples, channels]")
-    n_samples, n_channels = data_uV.shape
+    # --- Normalise inputs to per-channel representation ---
+    if isinstance(sfreq, (int, float)):
+        # Scalar sfreq: data_uV must be 2D [samples, channels]
+        if not isinstance(data_uV, np.ndarray) or data_uV.ndim != 2:
+            raise ValueError("EDF writer expects data shaped as [samples, channels]")
+        n_samples, n_channels = data_uV.shape
+        ch_arrays: list[np.ndarray] = [data_uV[:, i] for i in range(n_channels)]
+        ch_sfreqs: list[float] = [float(sfreq)] * n_channels
+    else:
+        # Per-channel sfreqs
+        ch_sfreqs = [float(f) for f in sfreq]
+        n_channels = len(ch_sfreqs)
+        if isinstance(data_uV, np.ndarray) and data_uV.ndim == 2:
+            ch_arrays = [data_uV[:, i] for i in range(n_channels)]
+        else:
+            ch_arrays = [np.asarray(d, dtype=np.float32).ravel() for d in data_uV]
+
     if n_channels != len(ch_names):
         raise ValueError("Channel-name list must match waveform column count")
-    if n_samples == 0 or sfreq <= 0:
-        raise ValueError("Sampling frequency and data must be non-zero")
+    if n_channels == 0:
+        raise ValueError("No channels to write")
+    if any(f <= 0 for f in ch_sfreqs):
+        raise ValueError("Sampling frequency must be positive for all channels")
 
     # Guard against NaN/Inf from upstream scaling to keep EDF ranges finite.
-    if not np.isfinite(data_uV).all():
-        data_uV = np.where(np.isfinite(data_uV), data_uV, 0.0)
+    for i in range(n_channels):
+        if not np.isfinite(ch_arrays[i]).all():
+            ch_arrays[i] = np.where(np.isfinite(ch_arrays[i]), ch_arrays[i], 0.0)
 
     patient_meta = patient_meta or {}
     start = recording_start or datetime.utcnow()
-    
+
     # EDF+ compliant patient identification field
     # Format: <code> <sex> <birthdate> <name> with underscores for spaces in subfields
     patient_field = _format_edfplus_patient(patient_meta)
-    
+
     # EDF+ compliant recording identification field
     # Format: Startdate DD-MMM-YYYY <admin_code> <technician> <equipment>
     recording_field = _format_edfplus_recording(start, patient_meta)
 
-    # Use 1-second data records to stay well under EDF size limits
-    # This ensures compatibility with strict readers like EDFbrowser
+    # Use 1-second data records to stay well under EDF size limits.
+    # Each channel declares its own samples-per-record (= its Hz rounded to int),
+    # so mixed-rate signals are stored natively without upsampling.
     record_duration = 1.0  # seconds per record
-    samples_per_channel_per_record = int(sfreq)  # samples per channel per record
-    
-    # Calculate total number of records (round up to include partial last record)
-    total_duration = n_samples / sfreq
+    samples_per_record: list[int] = [max(1, int(round(f))) for f in ch_sfreqs]
+
+    # Total recording duration driven by the longest channel.
+    total_duration = max(
+        (len(ch_arrays[i]) / ch_sfreqs[i] if ch_sfreqs[i] > 0 else 0.0)
+        for i in range(n_channels)
+    )
+    if total_duration <= 0:
+        raise ValueError("Sampling frequency and data must be non-zero")
     n_records = int(np.ceil(total_duration / record_duration))
     
     # Include annotations signal if annotations are provided
@@ -380,24 +409,26 @@ def write_edf(
     # Build signal labels
     labels = [_channel_label(name, idx + 1) for idx, name in enumerate(ch_names)]
     
-    # Calculate physical ranges from actual data
-    physical_min = np.min(data_uV, axis=0)
-    physical_max = np.max(data_uV, axis=0)
-    
-    # EDF spec requires physical_min < physical_max (strictly less than)
-    # For constant signals (e.g., all zeros), ensure a minimal range
-    # We add a tiny offset to max when min == max
+    # Calculate physical ranges from actual data (per channel)
+    physical_min = np.array(
+        [np.min(d) if d.size > 0 else 0.0 for d in ch_arrays]
+    )
+    physical_max = np.array(
+        [np.max(d) if d.size > 0 else 1.0 for d in ch_arrays]
+    )
+
+    # EDF spec requires physical_min < physical_max (strictly less than).
+    # For constant signals (e.g., all zeros), add a tiny offset to max.
     equal_mask = physical_min == physical_max
     if np.any(equal_mask):
-        # Add 1.0 to max for channels with constant values (preserves the data)
         physical_max = np.where(equal_mask, physical_max + 1.0, physical_max)
-    
+
     physical_diff = np.maximum(physical_max - physical_min, 1.0)
-    
-    # Digital range for EEG signals: full 16-bit signed range
+
+    # Digital range: full 16-bit signed range
     digital_min = np.full(n_channels, -32768, dtype=np.int32)
     digital_max = np.full(n_channels, 32767, dtype=np.int32)
-    samples_per_record_array = np.full(n_channels, samples_per_channel_per_record, dtype=np.int32)
+    samples_per_record_array = np.array(samples_per_record, dtype=np.int32)
 
     if include_annotations:
         # EDF Annotations signal per EDF+ spec section 2.2.1
@@ -464,30 +495,29 @@ def write_edf(
         handle.write(header)
         
         # Write data records
-        # EDF format: for each record, write all channels sequentially
+        # EDF format: for each record, write all channels sequentially.
+        # Each channel uses its own samples-per-record (native rate support).
         for record_idx in range(n_records):
-            # Calculate sample range for this record
-            start_sample = record_idx * samples_per_channel_per_record
-            end_sample = min(start_sample + samples_per_channel_per_record, n_samples)
-            actual_samples = end_sample - start_sample
-            
             # Write each signal's data for this record
             for ch_idx in range(n_channels):
-                # Get this channel's data for this record
-                channel_data = data_uV[start_sample:end_sample, ch_idx]
-                
+                spr = samples_per_record[ch_idx]
+                ch_start = record_idx * spr
+                ch_end = min(ch_start + spr, len(ch_arrays[ch_idx]))
+                channel_data = ch_arrays[ch_idx][ch_start:ch_end]
+                actual_samples = len(channel_data)
+
                 # Scale to digital values
                 scaled = (
                     (channel_data - physical_min[ch_idx]) * scales[ch_idx] + digital_min[ch_idx]
                 )
                 signal = np.clip(np.rint(scaled), -32768, 32767).astype("<i2")
-                
+
                 # Pad with zeros if this is a partial record (last record)
-                if actual_samples < samples_per_channel_per_record:
-                    padded = np.zeros(samples_per_channel_per_record, dtype="<i2")
+                if actual_samples < spr:
+                    padded = np.zeros(spr, dtype="<i2")
                     padded[:actual_samples] = signal
                     signal = padded
-                
+
                 handle.write(signal.tobytes())
             
             # Write annotation signal for this record if included

@@ -95,15 +95,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _default_patient_metadata(path: Path) -> dict[str, str]:
-    digest = hashlib.sha1(str(path).encode("utf-8"), usedforsecurity=False).hexdigest()[:8].upper()
-    return {
-        "PatientName": "Anon",
-        "PatientID": f"SUBJ-{digest}",
-        "PatientSex": "O",
+def _patient_meta_from_header(nrv_header) -> dict[str, str]:
+    """Extract patient metadata from the parsed .e file header."""
+    info = nrv_header.PatientInfo or {}
+
+    first = str(info.get("firstName") or "").strip()
+    last = str(info.get("lastName") or "").strip()
+    name_parts = [p for p in [first, last] if p]
+    patient_name = " ".join(name_parts) if name_parts else "X"
+
+    # altID holds the CPR number (DDMMYY-XXXX); prefer it over the internal GUID in patientID
+    patient_id = str(info.get("altID") or info.get("patientID") or "").strip() or "X"
+
+    # sexID is stored as a Nicolet GUID; map known values to EDF M/F codes
+    _SEX_GUID_MAP = {
+        "{0ADD99E3-ACCA-11CF-9B9A-0800099E03CD}": "M",
+        "{0ADD99E4-ACCA-11CF-9B9A-0800099E03CD}": "F",
+    }
+    sex_raw = str(info.get("sexID") or "").strip().upper()
+    patient_sex = _SEX_GUID_MAP.get(sex_raw, sex_raw if sex_raw else "X")
+
+    dob = info.get("DOB")
+    if dob is not None and hasattr(dob, "strftime"):
+        birthdate = dob.strftime("%Y-%m-%d")
+    else:
+        birthdate = str(dob).strip() if dob else ""
+
+    meta: dict[str, str] = {
+        "PatientName": patient_name,
+        "PatientID": patient_id,
+        "PatientSex": patient_sex,
         "StudyDescription": "Nicolet EEG export",
         "SeriesDescription": "Nicolet EEG export",
     }
+    if birthdate:
+        meta["PatientBirthDate"] = birthdate
+    return meta
 
 
 def _load_patient_rules(path: Path | None) -> list[dict[str, str]]:
@@ -123,8 +150,10 @@ def _load_patient_rules(path: Path | None) -> list[dict[str, str]]:
     return rules
 
 
-def _select_patient_metadata(path: Path, rules: Iterable[dict[str, str]]) -> dict[str, str]:
-    base = _default_patient_metadata(path)
+def _select_patient_metadata(
+    path: Path, rules: Iterable[dict[str, str]], nrv_header=None
+) -> dict[str, str]:
+    base = _patient_meta_from_header(nrv_header) if nrv_header is not None else {}
     for rule in rules:
         pattern = rule.get("glob")
         if not isinstance(pattern, str):
@@ -458,6 +487,30 @@ def _filter_vendor_events(events: Sequence[EventItem] | None) -> list[EventItem]
     ]
 
 
+def _read_channels_native_multirate(
+    input_path: Path,
+    header,
+    channels: list[int],
+) -> tuple[list[np.ndarray], list[float]]:
+    """Read each channel at its native sampling rate without resampling.
+
+    Returns a tuple of (channel_data_list, channel_rates_list) where each
+    element corresponds to one channel in *channels*.  Channels with
+    variable rates across segments are read at the first-segment rate.
+    """
+    channel_data: list[np.ndarray] = []
+    channel_rates: list[float] = []
+    for ch in channels:
+        rate, _ = _channel_rate_and_variation(header, ch - 1)
+        if rate is None or rate <= 0:
+            rate = float(header.targetSamplingRate or 0.0)
+        data = read_nervus_data(input_path, header, channels=[ch])
+        vec: np.ndarray = data[0] if data.size else np.zeros(0, dtype=np.float32)
+        channel_data.append(vec)
+        channel_rates.append(float(rate))
+    return channel_data, channel_rates
+
+
 def _resample_channel_segments(
     input_path: Path,
     header,
@@ -643,6 +696,39 @@ def _notch_filter(
         filtered[:, idx] = filtfilt(b, a, waveform[:, idx])
     
     return filtered
+
+
+def _ecg_channel_indices(channel_labels: list[str]) -> list[int]:
+    """Return indices of channels identified as ECG/EKG."""
+    return [
+        i for i, label in enumerate(channel_labels)
+        if label.upper().strip() in ("EKG", "ECG")
+    ]
+
+
+def _apply_ecg_polarity_correction(
+    data: np.ndarray | list[np.ndarray],
+    ecg_indices: list[int],
+) -> np.ndarray | list[np.ndarray]:
+    """Negate ECG channels to correct for Nicolet amplifier polarity convention.
+
+    Nicolet EEG amplifiers record ECG with reversed input polarity compared to
+    the standard Lead II convention (V_RA−V_LL instead of V_LL−V_RA).  The
+    Nicolet viewer compensates during display; EDF writers must negate these
+    channels so that downstream EDF tools see the correct polarity.
+    """
+    if not ecg_indices:
+        return data
+    if isinstance(data, list):
+        result = list(data)
+        for i in ecg_indices:
+            result[i] = -result[i]
+        return result
+    # 2-D array: shape (samples, channels)
+    corrected = data.copy()
+    for i in ecg_indices:
+        corrected[:, i] = -corrected[:, i]
+    return corrected
 
 
 def _categorize_channel(label: str) -> str:
@@ -910,20 +996,21 @@ def convert_file(
     if not fs:
         raise RuntimeError("Unable to determine sampling frequency from header")
 
-    channels = _select_channels(nrv_header, include_all=resample_to is not None)
+    channels = _select_channels(nrv_header, include_all=True)
     if not channels:
         raise RuntimeError("No channels available for conversion")
 
     if status_cb:
         status_cb("read data")
     channel_labels = _channel_labels(nrv_header, channels)
+    ecg_indices = _ecg_channel_indices(channel_labels)
     mixed_across_channels, mixed_over_time = _sampling_rate_variation(nrv_header, channels)
     if resample_to is not None and mixed_over_time:
         logger.warning(
             "Sampling rates vary across segments; resampling is applied per segment."
         )
 
-    patient_meta = _select_patient_metadata(input_path, patient_rules)
+    patient_meta = _select_patient_metadata(input_path, patient_rules, nrv_header)
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved_output = Path(output_path) if output_path else _candidate_output_path(input_path, output_dir, input_root)
     segments = nrv_header.Segments or []
@@ -950,6 +1037,7 @@ def convert_file(
                 if status_cb:
                     status_cb(f"notch filter (segment {seg_idx + 1}/{len(segments)})")
                 seg_waveform = _notch_filter(seg_waveform, float(seg_fs), notch)
+            seg_waveform = _apply_ecg_polarity_correction(seg_waveform, ecg_indices)
 
             segment_events = _segment_events(nrv_header.Events, segment, seg_idx)
             if vendor_style:
@@ -1007,6 +1095,57 @@ def convert_file(
             if status_cb:
                 status_cb("notch filter")
             waveform = _notch_filter(waveform, float(fs), notch)
+        waveform = _apply_ecg_polarity_correction(waveform, ecg_indices)
+        adjusted_events = _adjust_events_for_gaps(
+            nrv_header.Events, nrv_header.Segments, nrv_header.startDateTime
+        )
+        if vendor_style:
+            adjusted_events = _filter_vendor_events(adjusted_events)
+        if status_cb:
+            status_cb("write edf")
+        write_edf(
+            resolved_output, waveform, fs, channel_labels, patient_meta,
+            recording_start=nrv_header.startDateTime, annotations=adjusted_events,
+        )
+        edf_fs: float | list[float] = fs
+        edf_sample_count: int = waveform.shape[0]
+    elif mixed_across_channels and resample_to is None:
+        # Native multi-rate: read each channel at its own sampling frequency and
+        # write them to EDF without any upsampling.
+        if status_cb:
+            status_cb("read data (multi-rate)")
+        ch_data_list, ch_rate_list = _read_channels_native_multirate(
+            input_path, nrv_header, channels
+        )
+        # Apply optional filters per channel at its native rate
+        if lowcut is not None or highcut is not None:
+            if status_cb:
+                status_cb("bandpass filter")
+            ch_data_list = [
+                _bandpass_filter(d.reshape(-1, 1), r, lowcut, highcut)[:, 0]
+                for d, r in zip(ch_data_list, ch_rate_list)
+            ]
+        if notch is not None and notch > 0:
+            if status_cb:
+                status_cb("notch filter")
+            ch_data_list = [
+                _notch_filter(d.reshape(-1, 1), r, notch)[:, 0]
+                for d, r in zip(ch_data_list, ch_rate_list)
+            ]
+        ch_data_list = _apply_ecg_polarity_correction(ch_data_list, ecg_indices)
+        adjusted_events = _adjust_events_for_gaps(
+            nrv_header.Events, nrv_header.Segments, nrv_header.startDateTime
+        )
+        if vendor_style:
+            adjusted_events = _filter_vendor_events(adjusted_events)
+        if status_cb:
+            status_cb("write edf")
+        write_edf(
+            resolved_output, ch_data_list, ch_rate_list, channel_labels, patient_meta,
+            recording_start=nrv_header.startDateTime, annotations=adjusted_events,
+        )
+        edf_fs = ch_rate_list
+        edf_sample_count = max((len(d) for d in ch_data_list), default=0)
     else:
         waveform = read_nervus_data(input_path, nrv_header, channels=channels).T  # samples x channels
 
@@ -1028,31 +1167,30 @@ def convert_file(
             waveform = _resample_waveform(waveform, float(fs), float(resample_to))
             fs = float(resample_to)
 
-    adjusted_events = _adjust_events_for_gaps(
-        nrv_header.Events, nrv_header.Segments, nrv_header.startDateTime
-    )
-    if vendor_style:
-        adjusted_events = _filter_vendor_events(adjusted_events)
-    if status_cb:
-        status_cb("write edf")
-    write_edf(
-        resolved_output,
-        waveform,
-        fs,
-        channel_labels,
-        patient_meta,
-        recording_start=nrv_header.startDateTime,
-        annotations=adjusted_events,
-    )
+        waveform = _apply_ecg_polarity_correction(waveform, ecg_indices)
+        adjusted_events = _adjust_events_for_gaps(
+            nrv_header.Events, nrv_header.Segments, nrv_header.startDateTime
+        )
+        if vendor_style:
+            adjusted_events = _filter_vendor_events(adjusted_events)
+        if status_cb:
+            status_cb("write edf")
+        write_edf(
+            resolved_output, waveform, fs, channel_labels, patient_meta,
+            recording_start=nrv_header.startDateTime, annotations=adjusted_events,
+        )
+        edf_fs = fs
+        edf_sample_count = waveform.shape[0]
+
     if json_sidecar:
         if status_cb:
             status_cb("write json")
         _write_json_sidecar(
             resolved_output,
             source_path=input_path,
-            sampling_rate=fs,
+            sampling_rate=edf_fs if isinstance(edf_fs, float) else edf_fs[0],
             channel_labels=channel_labels,
-            sample_count=waveform.shape[0],
+            sample_count=edf_sample_count,
             start_time=nrv_header.startDateTime,
             events=adjusted_events,
             nrv_header=nrv_header,
