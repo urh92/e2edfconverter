@@ -4,13 +4,22 @@
 
 A Python tool to convert Nicolet/Nervus `.e` EEG files into standard EDF+ format. No vendor DLLs, no MATLAB (which costs money!), just Python! I couldn't find a native Python way to get `.e` files out of their vendor format, so me and Opus 4.5 wrote this.
 
-> **Acknowledgment**: This project wouldn't exist without the excellent [FieldTrip](https://github.com/fieldtrip/fieldtrip) toolbox. Their MATLAB implementation of the Nervus/Nicolet file format (`read_nervus_header.m` and `read_nervus_data.m`) was the foundation for this Python port. Since then, we've added substantial GUID/event parsing through our own reverse‑engineering work. Thank you to the FieldTrip team!
+> **Acknowledgment**: This project wouldn't exist without the excellent [FieldTrip](https://github.com/fieldtrip/fieldtrip) toolbox. Their MATLAB implementation of the Nervus/Nicolet file format (`read_nervus_header.m` and `read_nervus_data.m`) was the foundation for this Python port. Since then, we've added substantial GUID/event and channel ID parsing logic through our own reverse‑engineering work. Thank you to the FieldTrip team!
 
 > **Note**: Some of our reverse‑engineered event labels are (unfortunately) in Norwegian.
+>
+> **Scope note**: This converter is primarily an in-house tool and includes some site-specific recovery heuristics (for example, fixed numeric-ID channel mappings used in our local recordings). These defaults improve our internal datasets, but may not match naming conventions used at other institutions.
 
 ## Quick Start
 
-The easiest way — no installation needed:
+Clone the repository (or download it as a ZIP) from GitHub:
+
+```bash
+git clone https://github.com/haukurtg/e2edfconverter.git
+cd e2edfconverter
+```
+
+The easiest way — no manual environment/dependency setup needed (`uv` handles it for you):
 
 ```bash
 # Install uv if you don't have it (https://docs.astral.sh/uv/)
@@ -21,6 +30,13 @@ uv run --isolated nicolet-e2edf --in /path/to/recording.e --out ./edf_output
 
 # Convert a folder of .e/.eeg files
 uv run --isolated nicolet-e2edf --in ./my_eeg_folder --out ./edf_output
+```
+
+If you want a local environment for repeated use/development:
+
+```bash
+uv sync
+uv run nicolet-e2edf --help
 ```
 
 ### Interactive Mode
@@ -39,7 +55,7 @@ uv run --isolated --with rich nicolet-e2edf --ui
 |--------|-------------|
 | `--in` | Input `.e`/`.eeg` file or folder |
 | `--out` | Output directory for EDF files |
-| `--glob` | Filter pattern when input is a folder (e.g. `Patient1_*`) |
+| `--glob` | Filter pattern when input is a folder (e.g. `recording_*`) |
 | `--json-sidecar` | Also emit a `.json` with metadata (channels, events, etc.) |
 | `--split-by-segment` | Output one EDF per segment if the recording contains multiple segments |
 | `--vendor-style` | Suppress system events to better match vendor EDF exports |
@@ -73,21 +89,24 @@ uv run --isolated nicolet-e2edf \
 There's a bundled viewer script that shows your EDF in a double-banana montage:
 
 ```bash
-uv run --isolated --with mne python inspect_edf.py ./edf_output/Patient1.edf
+uv run --isolated --with mne python inspect_edf.py ./edf_output/recording.edf
 ```
 
 **Note:** When using the interactive TUI (`--ui`), the viewer is automatically launched with MNE in an isolated environment if needed. No manual installation required!
 
 Options: `--lowcut`, `--highcut`, `--notch`, `--snapshot out.png` (for headless systems).
 
+Filtering during conversion (`--lowcut`, `--highcut`, `--notch`) is lossy. In most cases, keep exports unfiltered and only use conversion-time filtering when you intentionally want a preprocessed output for direct downstream use (for example, an ML pipeline).
+
 ## Limitations
 
-- Mixed sampling rates: default exports only dominant-rate channels; use `--resample-to` to include all "on" channels (future: resample off-rate channels to dominant/max instead of excluding).
-- Edge case (future dominant-rate resample mode): if a minority channel has a higher sampling rate, resampling to the dominant rate would downsample it.
+- Mixed sampling rates: default exports only dominant-rate channels; use `--resample-to` to include all "on" channels.
+- When `--resample-to` is used, channels are resampled to the requested integer EDF rate.
 - Events are written as EDF+ annotations
 - EVENTTYPEINFOGUID labels are reverse-engineered; unknown GUIDs may be exported as UNKNOWN.
-- `.eeg` support is **experimental and not prioritized**: some files may convert, but signal data and channel labels can be unreliable. Treat `.eeg` as work-in-progress.
-- Some `.e` recordings store only numeric channel IDs (e.g., `1..64`). In those cases even vendor EDF exports keep numeric labels, so this is expected unless an external montage mapping is available. We still need a consistent way to map these when the source provides it.
+- `.eeg` support is currently not reliable; we need a larger `.eeg` dataset to implement and validate it properly.
+- Some `.e` recordings store only numeric channel IDs (e.g., `1..64`). The numeric-channel fix and montage-recovery strategy (from `v0.2.5`) are mainly aimed at recovering channel names in atypical multi-channel EEG setups (`32`, `64`, `128`, etc.) using source montage derivations, fixed DERIVATION tables, and hidden montage catalogs.
+- The CLI supports folder input, but processes files serially. For large cohorts, it is usually more efficient to call the CLI from a small batch wrapper that runs multiple workers and tracks progress/errors.
 
 ## Contributing
 

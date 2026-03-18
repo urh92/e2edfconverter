@@ -52,7 +52,6 @@ def _read_section_chunk(handle, entry, start_offset_samples: int, count: int) ->
 def _read_channel_window(
     handle,
     sections,
-    section_lengths,
     cumulative_lengths,
     start_sample: int,
     count: int,
@@ -61,11 +60,19 @@ def _read_channel_window(
 
     if count <= 0:
         return np.empty(0, dtype=np.int16)
-    output = np.zeros(count, dtype=np.int16)
+    if not sections:
+        return np.empty(0, dtype=np.int16)
+    output = np.empty(count, dtype=np.int16)
     written = 0
     target_start = start_sample
     target_end = start_sample + count
-    for idx, entry in enumerate(sections):
+    start_idx = int(np.searchsorted(cumulative_lengths, target_start, side="right") - 1)
+    if start_idx < 0:
+        start_idx = 0
+    if start_idx >= len(sections):
+        start_idx = len(sections) - 1
+    for idx in range(start_idx, len(sections)):
+        entry = sections[idx]
         section_start = cumulative_lengths[idx]
         section_end = cumulative_lengths[idx + 1]
         if target_end <= section_start:
@@ -140,7 +147,7 @@ def read_nervus_data(
             if sections is None:
                 section_idx = _lookup_static_index(header, channel_zb)
                 sections_cache[channel_zb] = _collect_sections(header, section_idx)
-            entries, section_lengths, cumulative_lengths = sections_cache[channel_zb]
+            entries, _section_lengths, cumulative_lengths = sections_cache[channel_zb]
             for seg_idx, segment in enumerate(header.Segments):
                 # Translate the global sample window into the portion stored inside this segment.
                 segment_start = cumulative_segment_lengths[seg_idx]
@@ -156,7 +163,6 @@ def read_nervus_data(
                 raw = _read_channel_window(
                     handle,
                     entries,
-                    section_lengths,
                     cumulative_lengths,
                     int(window_start),
                     int(samples_to_copy),

@@ -1,4 +1,4 @@
-"""Legacy Nicolet/Nervus `.eeg` parsing helpers."""
+"""Legacy Nicolet/Nervus `.e` parsing helpers (pre-2012 fallback)."""
 
 from __future__ import annotations
 
@@ -128,8 +128,7 @@ def _read_annotations(
             start_date = [_read_u16(handle) for _ in range(3)]
             _read_u16(handle)
             _read_u16(handle)
-            aux = _read_u16(handle)
-            _has_end = aux != 1
+            _read_u16(handle)
             _ = [_read_u16(handle) for _ in range(3)]
             comment = _read_str(handle, 42)
             _ = [_read_u16(handle) for _ in range(64)]
@@ -149,6 +148,7 @@ def _read_annotations(
                     label=label,
                     IDStr="Annotation",
                     annotation=annotation,
+                    rawLabel=label,
                 )
             )
         else:
@@ -201,13 +201,13 @@ def read_legacy_header(path: str | Path) -> NervusHeader:
         start_time = list(reversed(start_time_raw))
         start_date = [_read_u16(handle) for _ in range(3)]
         _ = [_read_u16(handle) for _ in range(3)]
-        end_time_raw = [_read_u16(handle) for _ in range(3)]
-        end_time = list(reversed(end_time_raw))
-        end_date = [_read_u16(handle) for _ in range(3)]
+        # End timestamp fields are present in the section layout but currently
+        # unused by the converter; read and discard to keep offsets aligned.
+        _ = [_read_u16(handle) for _ in range(3)]
+        _ = [_read_u16(handle) for _ in range(3)]
         _ = [_read_u16(handle) for _ in range(3)]
 
         start_dt = _build_datetime(start_date, start_time)
-        _ = _build_datetime(end_date, end_time)
 
         loc1 = locs_by_id.get(1)
         if not loc1:

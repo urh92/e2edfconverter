@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterable, Sequence
+import re
+from io import BytesIO
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -97,6 +99,7 @@ STATIC_PACKET_ID_MAP = {
     "{024FA81F-6A83-43C8-8C82-241A5501F0A1}": "SPECTRUMGUID",
     "{8032E68A-EA3E-42E8-893E-6E93C59ED515}": "SIGNALINFOGUID",
     "{30950D98-C39C-4352-AF3E-CB17D5B93DED}": "SENSORINFOGUID",
+    "{0315370D-8D0D-4C32-AE2D-141476979301}": "INPUTMONTAGEGUID",
     "{F5D39CD3-A340-4172-A1A3-78B2CDBCCB9F}": "DERIVEDSIGNALINFOGUID",
     "{969FBB89-EE8E-4501-AD40-FB5A448BC4F9}": "ARTIFACTINFOGUID",
     "{02948284-17EC-4538-A7FA-8E18BD65E167}": "STUDYINFOGUID",
@@ -116,6 +119,13 @@ _UINT16 = struct.Struct("<H")
 _UINT32 = struct.Struct("<I")
 _UINT64 = struct.Struct("<Q")
 _DOUBLE = struct.Struct("<d")
+
+# Guardrails for reverse-engineered hidden montage catalogs found in UNKNOWN
+# static packet families. Some recordings carry very large UNKNOWN blobs that
+# are not montage catalogs and can make title/token scanning prohibitively slow.
+UNKNOWN_MONTAGE_MIN_BLOB_BYTES = 1024
+UNKNOWN_MONTAGE_MAX_BLOB_BYTES = 8 * 1024 * 1024
+UNKNOWN_MONTAGE_MAX_TOKENS = 50_000
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +554,111 @@ def _read_channel_info(
     return channel_info
 
 
+def _read_input_info(
+    handle: BinaryIO,
+    static_packets: list[StaticPacket],
+    main_index: list[MainIndexEntry],
+) -> list[dict[str, object]]:
+    """Parse INPUTGUID as a fixed-record input map table when present.
+
+    In some recordings this packet contains a record table starting
+    at offset 752 with 152-byte records. The first fields encode an input ID,
+    slot index, and X/Y geometry coordinates. The parser is conservative and
+    returns an empty list if the expected table shape is not present.
+    """
+
+    packet = _lookup_static(static_packets, idstr="INPUTGUID")
+    if packet is None:
+        return []
+    index_entries = _main_index_by_section(main_index, packet.index)
+    if not index_entries:
+        return []
+
+    blob = b""
+    for entry in index_entries:
+        if entry.sectionL <= 0:
+            continue
+        handle.seek(entry.offset, 0)
+        blob += _read_exact(handle, int(entry.sectionL))
+    if len(blob) < 752 + 152:
+        return []
+
+    start = 752
+    stride = 152
+    n_records = (len(blob) - start) // stride
+    if n_records <= 0:
+        return []
+
+    rows: list[dict[str, object]] = []
+    for rec_idx in range(int(n_records)):
+        rec = blob[start + rec_idx * stride : start + (rec_idx + 1) * stride]
+        if len(rec) < stride:
+            break
+        u32 = [struct.unpack_from("<I", rec, i)[0] for i in range(0, stride, 4)]
+        rows.append(
+            {
+                "recordIndex": rec_idx,
+                "inputID": int(u32[0]),
+                "slotIndex": int(u32[2]),
+                "x": int(u32[3]),
+                "y": int(u32[4]),
+                "rawU32": u32,
+            }
+        )
+    return rows
+
+
+def _read_input_settings_info(
+    handle: BinaryIO,
+    static_packets: list[StaticPacket],
+    main_index: list[MainIndexEntry],
+) -> list[dict[str, object]]:
+    """Parse INPUTSETTINGSGUID as a fixed-record settings table when present.
+
+    In some recordings this packet contains a record table starting
+    at offset 752 with 176-byte records. The setting ID appears at ``u32[11]``.
+    The parser returns a generic structured view for later higher-level
+    inference and does not assume semantic meaning for all fields yet.
+    """
+
+    packet = _lookup_static(static_packets, idstr="INPUTSETTINGSGUID")
+    if packet is None:
+        return []
+    index_entries = _main_index_by_section(main_index, packet.index)
+    if not index_entries:
+        return []
+
+    blob = b""
+    for entry in index_entries:
+        if entry.sectionL <= 0:
+            continue
+        handle.seek(entry.offset, 0)
+        blob += _read_exact(handle, int(entry.sectionL))
+    if len(blob) < 752 + 176:
+        return []
+
+    start = 752
+    stride = 176
+    n_records = (len(blob) - start) // stride
+    if n_records <= 0:
+        return []
+
+    rows: list[dict[str, object]] = []
+    for rec_idx in range(int(n_records)):
+        rec = blob[start + rec_idx * stride : start + (rec_idx + 1) * stride]
+        if len(rec) < stride:
+            break
+        u32 = [struct.unpack_from("<I", rec, i)[0] for i in range(0, stride, 4)]
+        rows.append(
+            {
+                "recordIndex": rec_idx,
+                "settingID": int(u32[11]) if len(u32) > 11 else None,
+                "rawU32": u32,
+            }
+        )
+    return rows
+
+
 def _read_montage_info(
     handle: BinaryIO,
     static_packets: list[StaticPacket],
@@ -573,8 +688,69 @@ def _read_montage_info(
                 "derivationName": derivation_name,
                 "signalName1": signal_name_1,
                 "signalName2": signal_name_2,
+                "source": "derivation_main_table",
             }
         )
+
+    # Some files embed AV derivation rows as UTF-16 token streams inside one
+    # or more DERIVATIONGUID sections, including the first section.
+    # Parse all sections and merge without duplicates.
+    dedup_rows: set[tuple[str, str, str, str]] = {
+        (
+            str(row.get("montageName", "")),
+            str(row.get("derivationName", "")),
+            str(row.get("signalName1", "")),
+            str(row.get("signalName2", "")),
+        )
+        for row in montage
+    }
+    supplemental_chunks: list[bytes] = []
+    for extra_entry in index_entries:
+        if extra_entry.sectionL <= 0:
+            continue
+        handle.seek(extra_entry.offset, 0)
+        supplemental_chunks.append(_read_exact(handle, int(extra_entry.sectionL)))
+    supplemental_blob = b"".join(supplemental_chunks)
+    for row in _parse_supplemental_av_montage_rows(supplemental_blob):
+            signal_name_2 = str(row.get("signalName2", "")).strip()
+            if signal_name_2.isdigit() or not signal_name_2.upper().startswith("AV"):
+                row["source"] = "supplemental_generic"
+            key = (
+                str(row.get("montageName", "")),
+                str(row.get("derivationName", "")),
+                str(row.get("signalName1", "")),
+                str(row.get("signalName2", "")),
+            )
+            if key in dedup_rows:
+                continue
+            dedup_rows.add(key)
+            montage.append(row)
+
+    for row in _parse_derivation_fixed_record_montage_rows(supplemental_blob):
+            key = (
+                str(row.get("montageName", "")),
+                str(row.get("derivationName", "")),
+                str(row.get("signalName1", "")),
+                str(row.get("signalName2", "")),
+            )
+            if key in dedup_rows:
+                continue
+            dedup_rows.add(key)
+            montage.append(row)
+
+    for row in _read_unknown_montage_catalog_rows(handle, static_packets, main_index):
+            key = (
+                str(row.get("montageName", "")),
+                str(row.get("derivationName", "")),
+                str(row.get("signalName1", "")),
+                str(row.get("signalName2", "")),
+            )
+            if key in dedup_rows:
+                continue
+            dedup_rows.add(key)
+            montage.append(row)
+
+    montage.extend(_read_aux_av_montage_rows(handle, static_packets, main_index))
 
     # Attach display colors when available.
     display_packet = _lookup_static(static_packets, idstr="DISPLAYGUID")
@@ -595,6 +771,455 @@ def _read_montage_info(
                     montage[i]["displayName"] = display_name
                     montage[i]["color"] = color
     return montage
+
+
+def _parse_supplemental_av_montage_rows(chunk: bytes) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    if not chunk:
+        return rows
+
+    tokens = [
+        text.strip()
+        for text in chunk.decode("utf-16le", errors="ignore").split("\x00")
+        if text and text.strip()
+    ]
+
+    def _as_av_ref(token: str) -> str | None:
+        upper = token.upper()
+        match = re.search(r"AV\s*(\d{1,3})", upper)
+        if match:
+            return f"AV{int(match.group(1))}"
+        match = re.search(r"(\d{1,3})\s*AV", upper)
+        if match:
+            return f"AV{int(match.group(1))}"
+        return None
+
+    def _is_av_derivation(token: str) -> bool:
+        return bool(re.search(r"-\s*AV$", " ".join(token.split()).upper()))
+
+    def _is_supplemental_derivation(token: str) -> bool:
+        cleaned = " ".join(token.split())
+        if not cleaned or cleaned[0].isdigit():
+            return False
+        if "-" in cleaned:
+            return True
+        return bool(re.fullmatch(r"[A-Za-z]{2,8}", cleaned))
+
+    dedup: set[tuple[str, str, str]] = set()
+    current_ref: str | None = None
+    i = 0
+    while i < len(tokens):
+        token_ref = _as_av_ref(tokens[i])
+        if token_ref:
+            current_ref = token_ref
+
+        if i + 2 < len(tokens):
+            deriv_name, signal_name = tokens[i], tokens[i + 1]
+            explicit_ref = _as_av_ref(tokens[i + 2])
+            if _is_av_derivation(deriv_name) and signal_name.isdigit() and explicit_ref:
+                key = (signal_name, deriv_name, explicit_ref)
+                if key not in dedup:
+                    dedup.add(key)
+                    rows.append(
+                        {
+                            "montageName": explicit_ref,
+                            "derivationName": deriv_name,
+                            "signalName1": signal_name,
+                            "signalName2": explicit_ref,
+                        }
+                    )
+                current_ref = explicit_ref
+                if i + 3 < len(tokens) and tokens[i + 3] in {"\x01", "1"}:
+                    i += 4
+                else:
+                    i += 3
+                continue
+
+        if i + 1 < len(tokens):
+            deriv_name, signal_name = tokens[i], tokens[i + 1]
+            if _is_av_derivation(deriv_name) and signal_name.isdigit() and current_ref:
+                key = (signal_name, deriv_name, current_ref)
+                if key not in dedup:
+                    dedup.add(key)
+                    rows.append(
+                        {
+                            "montageName": current_ref,
+                            "derivationName": deriv_name,
+                            "signalName1": signal_name,
+                            "signalName2": current_ref,
+                        }
+                    )
+                i += 2
+                continue
+
+        if i + 3 < len(tokens):
+            deriv_name, signal_name, signal_name_2, marker = (
+                tokens[i],
+                tokens[i + 1],
+                tokens[i + 2],
+                tokens[i + 3],
+            )
+            if (
+                _is_supplemental_derivation(deriv_name)
+                and signal_name.isdigit()
+                and signal_name_2.isdigit()
+                and marker in {"\x01", "1"}
+            ):
+                key = (signal_name, deriv_name, signal_name_2)
+                if key not in dedup:
+                    dedup.add(key)
+                    rows.append(
+                        {
+                            "montageName": current_ref or "",
+                            "derivationName": deriv_name,
+                            "signalName1": signal_name,
+                            "signalName2": signal_name_2,
+                        }
+                    )
+                i += 4
+                continue
+
+        if i + 2 < len(tokens):
+            deriv_name, signal_name, marker = tokens[i], tokens[i + 1], tokens[i + 2]
+            if (
+                _is_supplemental_derivation(deriv_name)
+                and signal_name.isdigit()
+                and marker in {"\x01", "1"}
+            ):
+                key = (signal_name, deriv_name, "")
+                if key not in dedup:
+                    dedup.add(key)
+                    rows.append(
+                        {
+                            "montageName": current_ref or "",
+                            "derivationName": deriv_name,
+                            "signalName1": signal_name,
+                            "signalName2": "",
+                        }
+                    )
+                i += 3
+                continue
+
+        i += 1
+    return rows
+
+
+def _parse_derivation_fixed_record_montage_rows(chunk: bytes) -> list[dict[str, object]]:
+    """Parse fixed-size DERIVATION record tables (e.g. hidden 128-ref mappings)."""
+
+    rows: list[dict[str, object]] = []
+    if not chunk:
+        return rows
+
+    stride = 520
+    if len(chunk) < stride * 2:
+        return rows
+
+    n_records = len(chunk) // stride
+    records = [chunk[i * stride : (i + 1) * stride] for i in range(n_records)]
+    if len(records) < 2:
+        return rows
+
+    montage_name = _decode_utf16(records[0][40:104]) if len(records[0]) >= 104 else ""
+    candidates: list[dict[str, object]] = []
+    non_numeric_names = 0
+
+    for rec in records[1:]:
+        if len(rec) < 392:
+            continue
+        derivation_name = _decode_utf16(rec[232:360])
+        signal_name_1 = _decode_utf16(rec[360:392])
+        if not derivation_name or not signal_name_1 or not signal_name_1.isdigit():
+            continue
+        if not derivation_name.isdigit():
+            non_numeric_names += 1
+        candidates.append(
+            {
+                "montageName": montage_name,
+                "derivationName": derivation_name,
+                "signalName1": signal_name_1,
+                "signalName2": "",
+                "source": "derivation_fixed_table",
+            }
+        )
+
+    # Heuristic guard: avoid false positives on arbitrary DERIVATION payloads.
+    if len(candidates) < 8 or non_numeric_names < 3:
+        return []
+    return candidates
+
+
+def _parse_unknown_montage_catalog_rows(chunk: bytes) -> list[dict[str, object]]:
+    """Parse hidden UTF-16 montage catalogs (e.g. ``128 kanaler`` tables).
+
+    Some files contain repeated title-like tokens inside the same blob. For
+    named catalogs, the parser keeps the best-scoring contiguous chunk per
+    title instead of unioning all matches, which avoids mixing rows from
+    adjacent montage blocks.
+    """
+
+    rows: list[dict[str, object]] = []
+    if not chunk:
+        return rows
+
+    tokens = [
+        text.strip()
+        for text in chunk.decode("utf-16le", errors="ignore").split("\x00")
+        if text and text.strip()
+    ]
+    if not tokens:
+        return rows
+    # Extremely large token streams are typically noisy payloads rather than
+    # actual montage catalogs; skip to avoid pathological parse times.
+    if len(tokens) > UNKNOWN_MONTAGE_MAX_TOKENS:
+        return rows
+
+    def _collapse_spaces(text: str) -> str:
+        return " ".join(text.split())
+
+    title_cache: dict[str, str | None] = {}
+
+    def _extract_catalog_title(token: str) -> str | None:
+        cached = title_cache.get(token)
+        if token in title_cache:
+            return cached
+        cleaned = _collapse_spaces(token)
+        match = re.search(r"(\d{1,3}\s+KANALER)\b", cleaned.upper())
+        if not match:
+            # Some hidden catalogs use custom all-caps names
+            # with binary garbage prefixed inside the same UTF-16 token.
+            name_candidates = re.findall(r"[A-Za-z][A-Za-z0-9 _-]{2,31}", cleaned)
+            if not name_candidates:
+                return None
+            candidate = " ".join(name_candidates[-1].upper().split())
+            # Reject obvious channel labels so we don't start parsing in the
+            # middle of a channel-name sequence (e.g. VTP1, F3).
+            if re.fullmatch(r"[A-Z]{1,4}\d{0,3}[A-Z]?", candidate) and (
+                any(ch.isdigit() for ch in candidate) or len(candidate) <= 4
+            ):
+                title_cache[token] = None
+                return None
+            title_cache[token] = candidate
+            return candidate
+        count = int(match.group(1).split()[0])
+        result = f"{count} kanaler"
+        title_cache[token] = result
+        return result
+
+    channel_name_cache: dict[str, bool] = {}
+
+    def _is_catalog_channel_name(token: str) -> bool:
+        if token in channel_name_cache:
+            return channel_name_cache[token]
+        cleaned = _collapse_spaces(token)
+        if not cleaned or cleaned.isdigit() or _extract_catalog_title(cleaned):
+            channel_name_cache[token] = False
+            return False
+        if len(cleaned) > 24:
+            channel_name_cache[token] = False
+            return False
+        result = bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9+\-_/ ]{0,23}", cleaned))
+        channel_name_cache[token] = result
+        return result
+
+    dedup: set[tuple[str, str]] = set()
+    # Repeated noisy title hits can appear in the same blob (e.g. custom local
+    # montage names prefixed with binary garbage). For named catalogs, unioning
+    # rows across all repeated occurrences can leak rows from adjacent montages.
+    # Keep only the best-scoring chunk per named title.
+    named_catalog_best: dict[str, tuple[tuple[int, int, int, int], list[dict[str, object]]]] = {}
+
+    def _named_catalog_chunk_score(pairs: list[tuple[str, str]]) -> tuple[int, int, int, int]:
+        ids = sorted({int(signal_id) for _, signal_id in pairs if str(signal_id).isdigit()})
+        if not ids:
+            return (0, 0, 0, 0)
+        min_id = ids[0]
+        starts_at_1 = 1 if min_id == 1 else 0
+        contiguous_from_min = 0
+        expected = min_id
+        for value in ids:
+            if value != expected:
+                break
+            contiguous_from_min += 1
+            expected += 1
+        # Prefer catalogs that start at 1, then longest contiguous run, then
+        # more rows. Finally prefer smaller minimum ID.
+        return (starts_at_1, contiguous_from_min, len(ids), -min_id)
+
+    i = 0
+    while i < len(tokens):
+        montage_name = _extract_catalog_title(tokens[i])
+        if not montage_name:
+            i += 1
+            continue
+
+        expected_match = re.match(r"(\d+)", montage_name)
+        expected_count = int(expected_match.group(1)) if expected_match else 0
+        pairs: list[tuple[str, str]] = []
+        seen_signal_ids: set[str] = set()
+        j = i + 1
+        misses = 0
+        while j < len(tokens):
+            if _extract_catalog_title(tokens[j]) and pairs:
+                break
+            if j + 1 < len(tokens):
+                left = _collapse_spaces(tokens[j])
+                right = _collapse_spaces(tokens[j + 1])
+                if _is_catalog_channel_name(left) and right.isdigit():
+                    if right not in seen_signal_ids:
+                        seen_signal_ids.add(right)
+                        pairs.append((left, right))
+                    j += 2
+                    misses = 0
+                    continue
+                if left.isdigit() and _is_catalog_channel_name(right):
+                    if left not in seen_signal_ids:
+                        seen_signal_ids.add(left)
+                        pairs.append((right, left))
+                    j += 2
+                    misses = 0
+                    continue
+            j += 1
+            misses += 1
+            if pairs and misses > 128:
+                break
+
+        if pairs:
+            ids = [int(signal_id) for _, signal_id in pairs if signal_id.isdigit()]
+            unique_ids = set(ids)
+            min_required = max(16, min(expected_count // 2 if expected_count else 16, 64))
+            in_expected = [idx for idx in unique_ids if 1 <= idx <= max(expected_count, 1)]
+            # Named local catalogs may not encode channel count in
+            # the title, so require a larger row count for confidence.
+            if expected_count == 0:
+                min_required = max(min_required, 24)
+            if len(unique_ids) >= min_required and (
+                expected_count == 0 or len(in_expected) >= min_required
+            ):
+                for derivation_name, signal_name_1 in pairs:
+                    row = {
+                        "montageName": montage_name,
+                        "derivationName": derivation_name,
+                        "signalName1": signal_name_1,
+                        "signalName2": "",
+                        "source": "unknown_montage_catalog",
+                    }
+                    key = (montage_name, signal_name_1)
+                    if expected_count == 0:
+                        # Defer dedup/selection for named catalogs so repeated
+                        # title hits do not get union-merged across unrelated
+                        # nearby montage blocks.
+                        continue
+                    if key in dedup:
+                        continue
+                    dedup.add(key)
+                    rows.append(row)
+                if expected_count == 0:
+                    chunk_rows: list[dict[str, object]] = [
+                        {
+                            "montageName": montage_name,
+                            "derivationName": derivation_name,
+                            "signalName1": signal_name_1,
+                            "signalName2": "",
+                            "source": "unknown_montage_catalog",
+                        }
+                        for derivation_name, signal_name_1 in pairs
+                    ]
+                    score = _named_catalog_chunk_score(pairs)
+                    previous = named_catalog_best.get(montage_name)
+                    if previous is None or score > previous[0]:
+                        named_catalog_best[montage_name] = (score, chunk_rows)
+                # Numeric-title catalogs ("128 kanaler") are usually discrete
+                # blocks, so jumping to `j` is efficient. Named local catalogs
+                # can overlap/repeat in the blob and `j` may overshoot other
+                # valid titles, so advance conservatively.
+                i = j if expected_count > 0 else (i + 1)
+                continue
+
+        i += 1
+    for montage_name, (_score, chunk_rows) in named_catalog_best.items():
+        for row in chunk_rows:
+            key = (str(row.get("montageName", "")), str(row.get("signalName1", "")))
+            if key in dedup:
+                continue
+            dedup.add(key)
+            rows.append(row)
+    return rows
+
+
+def _read_unknown_montage_catalog_rows(
+    handle: BinaryIO,
+    static_packets: list[StaticPacket],
+    main_index: list[MainIndexEntry],
+) -> list[dict[str, object]]:
+    """Parse hidden montage catalogs from UNKNOWN static packet families."""
+
+    dedup: set[tuple[str, str, str, str]] = set()
+    rows: list[dict[str, object]] = []
+    main_index_by_section: dict[int, list[MainIndexEntry]] = {}
+    for entry in main_index:
+        main_index_by_section.setdefault(entry.sectionIdx, []).append(entry)
+    for packet in static_packets:
+        if packet.IDStr != "UNKNOWN":
+            continue
+        index_entries = main_index_by_section.get(packet.index, [])
+        if not index_entries:
+            continue
+        total_len = sum(int(entry.sectionL) for entry in index_entries if entry.sectionL and entry.sectionL > 0)
+        if total_len < UNKNOWN_MONTAGE_MIN_BLOB_BYTES or total_len > UNKNOWN_MONTAGE_MAX_BLOB_BYTES:
+            continue
+        blob_chunks: list[bytes] = []
+        for entry in index_entries:
+            if entry.sectionL <= 0:
+                continue
+            handle.seek(entry.offset, 0)
+            blob_chunks.append(_read_exact(handle, int(entry.sectionL)))
+        blob = b"".join(blob_chunks)
+        for row in _parse_unknown_montage_catalog_rows(blob):
+            key = (
+                str(row.get("montageName", "")),
+                str(row.get("derivationName", "")),
+                str(row.get("signalName1", "")),
+                str(row.get("signalName2", "")),
+            )
+            if key in dedup:
+                continue
+            dedup.add(key)
+            rows.append(row)
+    return rows
+
+
+def _read_aux_av_montage_rows(
+    handle: BinaryIO,
+    static_packets: list[StaticPacket],
+    main_index: list[MainIndexEntry],
+) -> list[dict[str, object]]:
+    aux_packet = _lookup_static(static_packets, idstr="INPUTMONTAGEGUID")
+    if aux_packet is None:
+        return []
+    index_entries = _main_index_by_section(main_index, aux_packet.index)
+    if not index_entries:
+        return []
+
+    dedup: set[tuple[str, str, str]] = set()
+    aux_rows: list[dict[str, object]] = []
+    for entry in index_entries:
+        if entry.sectionL <= 0:
+            continue
+        handle.seek(entry.offset, 0)
+        chunk = _read_exact(handle, int(entry.sectionL))
+        for row in _parse_supplemental_av_montage_rows(chunk):
+            key = (
+                str(row.get("signalName1", "")),
+                str(row.get("derivationName", "")),
+                str(row.get("montageName", "")),
+            )
+            if key in dedup:
+                continue
+            dedup.add(key)
+            row["source"] = "aux_av_table"
+            aux_rows.append(row)
+    return aux_rows
 
 
 def _read_dynamic_montages(dynamic_packets: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -922,13 +1547,9 @@ def _read_events(
     segments: Sequence[SegmentInfo] | None = None,
 ) -> list[EventItem]:
     """Read events from the Events section.
-    
-    Each event is stored in its own packet with structure:
-    - 16 bytes: packet GUID (must match _EVENT_PACKET_GUID)
-    - 8 bytes: packet length
-    - 240 bytes: event marker data
-    
-    Events are read sequentially until a non-matching GUID is found.
+
+    Event data may span multiple main-index sections, so we first concatenate
+    all bytes that belong to the Events static packet and then parse packet-by-packet.
     """
     event_packet = _lookup_static(static_packets, tag="Events")
     if event_packet is None:
@@ -937,115 +1558,119 @@ def _read_events(
     if not index_entries:
         return []
 
+    stream = bytearray()
+    for entry in index_entries:
+        if entry.sectionL <= 0:
+            continue
+        handle.seek(entry.offset, 0)
+        stream.extend(_read_exact(handle, entry.sectionL))
+    if not stream:
+        return []
+
+    stream_bytes = bytes(stream)
+    stream_len = len(stream_bytes)
+    buffer = BytesIO(stream_bytes)
     events: list[EventItem] = []
-    
-    # Start at the first event section
-    for entry_index, entry in enumerate(index_entries):
-        offset = entry.offset
-        if entry_index == 1:
-            offset += 248
-        section_end = entry.offset + entry.sectionL
-        
-        # Read packets sequentially until we hit a non-event GUID or section end
-        while offset < section_end:
-            handle.seek(offset, 0)
-            
-            # Read packet header: GUID (16 bytes) + length (8 bytes)
-            guid = _read_exact(handle, 16)
-            packet_length = _read_u64(handle)
-            
-            # Stop if this is not an event packet
-            if guid != _EVENT_PACKET_GUID:
+    offset = 0
+    while offset + 24 <= stream_len:
+        buffer.seek(offset, 0)
+        guid = _read_exact(buffer, 16)
+        packet_length = _read_u64(buffer)
+        if guid != _EVENT_PACKET_GUID:
+            next_offset = stream_bytes.find(_EVENT_PACKET_GUID, offset + 1)
+            if next_offset < 0:
                 break
-            if packet_length <= 0 or packet_length > section_end - offset or packet_length > 1_000_000:
+            offset = next_offset
+            continue
+        if packet_length < 240 or packet_length > 1_000_000 or offset + packet_length > stream_len:
+            next_offset = stream_bytes.find(_EVENT_PACKET_GUID, offset + 1)
+            if next_offset < 0:
                 break
-            if packet_length < 240:
-                break
-            
-            # Read ONE event from this packet
-            # Skip eventID (8 bytes, not used)
-            handle.seek(8, 1)
-            
-            date_ole = _read_double(handle)
-            date_fraction = _read_double(handle)
-            duration = _read_double(handle)
-            
-            # Skip 48 bytes reserved
-            handle.seek(48, 1)
-            
-            # User (12 UTF-16 chars = 24 bytes)
-            user_raw = _read_exact(handle, 12 * 2)
-            user = user_raw.decode("utf-16le", errors="ignore").rstrip("\x00 ")
-            
-            # Text length for annotations
-            text_len = _read_u64(handle)
-            
-            # Event type GUID
-            _guid_compact, guid_pretty = _mixed_endian_guid(_read_exact(handle, 16))
-            
-            # Skip Reserved4 (16 bytes)
-            handle.seek(16, 1)
-            
-            # Label (32 UTF-16 chars = 64 bytes)
-            label = _read_exact(handle, 32 * 2).decode("utf-16le", errors="ignore").rstrip("\x00 ")
-            if label == "-":
-                label = ""
-            
-            # Read optional text payload (used by annotations and some system events).
+            offset = next_offset
+            continue
+
+        # Skip eventID (8 bytes, not used)
+        buffer.seek(8, 1)
+
+        date_ole = _read_double(buffer)
+        date_fraction = _read_double(buffer)
+        duration = _read_double(buffer)
+
+        # Skip 48 bytes reserved
+        buffer.seek(48, 1)
+
+        # User (12 UTF-16 chars = 24 bytes)
+        user_raw = _read_exact(buffer, 12 * 2)
+        user = user_raw.decode("utf-16le", errors="ignore").rstrip("\x00 ")
+
+        # Text length for annotations
+        text_len = _read_u64(buffer)
+
+        # Event type GUID
+        _guid_compact, guid_pretty = _mixed_endian_guid(_read_exact(buffer, 16))
+
+        # Skip Reserved4 (16 bytes)
+        buffer.seek(16, 1)
+
+        # Label (32 UTF-16 chars = 64 bytes)
+        label = _read_exact(buffer, 32 * 2).decode("utf-16le", errors="ignore").rstrip("\x00 ")
+        if label == "-":
+            label = ""
+
+        # Read optional text payload (used by annotations and some system events).
+        annotation = None
+        if text_len > 0:
+            buffer.seek(32, 1)
+            bytes_left = offset + packet_length - buffer.tell()
+            max_chars = max(int(bytes_left // 2), 0)
+            read_chars = min(int(text_len), max_chars)
+            annotation_raw = _read_exact(buffer, read_chars * 2) if read_chars else b""
+            decoded = annotation_raw.decode("utf-16le", errors="ignore") if annotation_raw else ""
+            if "\x00" in decoded:
+                decoded = decoded.split("\x00")[0]
+            cleaned = decoded.rstrip("\x00")
+            annotation = cleaned if cleaned.strip() else None
+
+        label_text = _EVENT_GUID_LABELS.get(guid_pretty, "UNKNOWN")
+        # Prefer keeping annotation text as-is for EDF+ compatibility.
+        if label_text == "Photic" and annotation:
+            label = ""
+        if label_text == "Format change" and annotation:
+            label = ""
+        if label_text == "Recording Paused" and annotation:
+            label = ""
+        if label_text == "Event Comment" and annotation and not label:
+            label = annotation
             annotation = None
-            if text_len > 0:
-                handle.seek(32, 1)
-                bytes_left = offset + packet_length - handle.tell()
-                max_chars = max(int(bytes_left // 2), 0)
-                read_chars = min(int(text_len), max_chars)
-                annotation_raw = _read_exact(handle, read_chars * 2) if read_chars else b""
-                decoded = annotation_raw.decode("utf-16le", errors="ignore") if annotation_raw else ""
-                if "\x00" in decoded:
-                    decoded = decoded.split("\x00")[0]
-                cleaned = decoded.rstrip("\x00")
-                annotation = cleaned if cleaned.strip() else None
-            
-            label_text = _EVENT_GUID_LABELS.get(guid_pretty, "UNKNOWN")
-            # Prefer keeping annotation text as-is for EDF+ compatibility.
-            if label_text == "Photic" and annotation:
-                label = ""
-            if label_text == "Format change" and annotation:
-                label = ""
-            if label_text == "Recording Paused" and annotation:
-                label = ""
-            if label_text == "Event Comment" and annotation and not label:
-                label = annotation
-                annotation = None
-            event_time = _ole_to_datetime(date_ole + date_fraction / DAY_SECONDS)
-            seg_index = None
-            if segments:
-                seg_index = 0
-                for idx, segment in enumerate(segments):
-                    if segment.date <= event_time:
-                        seg_index = idx
-                    else:
-                        break
-            is_epoch = duration > 0.0
-            
-            events.append(
-                EventItem(
-                    dateOLE=date_ole,
-                    dateFraction=date_fraction,
-                    date=event_time,
-                    duration=duration,
-                    user=user,
-                    GUID=guid_pretty,
-                    label=label,
-                    IDStr=label_text,
-                    annotation=annotation,
-                    segmentIndex=seg_index,
-                    isEpoch=is_epoch,
-                )
+        event_time = _ole_to_datetime(date_ole + date_fraction / DAY_SECONDS)
+        seg_index = None
+        if segments:
+            seg_index = 0
+            for idx, segment in enumerate(segments):
+                if segment.date and segment.date <= event_time:
+                    seg_index = idx
+                else:
+                    break
+        is_epoch = duration > 0.0
+
+        events.append(
+            EventItem(
+                dateOLE=date_ole,
+                dateFraction=date_fraction,
+                date=event_time,
+                duration=duration,
+                user=user,
+                GUID=guid_pretty,
+                label=label,
+                IDStr=label_text,
+                annotation=annotation,
+                segmentIndex=seg_index,
+                isEpoch=is_epoch,
+                rawLabel=label or None,
             )
-            
-            # Move to next packet (offset + packet_length)
-            offset = offset + packet_length
-    
+        )
+        offset += packet_length
+
     return events
 
 
@@ -1105,7 +1730,12 @@ def _scan_utf16_label(buffer: bytes, start: int, max_scan: int = 2048, max_chars
 def _clean_event_label(text: str) -> str:
     if not text:
         return ""
-    cleaned = "".join(ch if ch.isascii() and ch.isprintable() else " " for ch in text)
+    cleaned = "".join(
+        ch
+        if ch.isprintable() and (ord(ch) <= 0x007E or 0x00A0 <= ord(ch) <= 0x024F)
+        else " "
+        for ch in text
+    )
     cleaned = " ".join(cleaned.split())
     if cleaned in {"yne pne", "yne åpne"}:
         return "Øyne åpnes"
@@ -1138,15 +1768,143 @@ def _looks_like_channel_label(text: str) -> bool:
     if not text:
         return False
     candidate = text.strip()
-    if len(candidate) > 16 or any(ch.isspace() for ch in candidate):
+    if len(candidate) > 32:
         return False
-    upper = candidate.upper()
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-+")
-    if any(ch not in allowed for ch in upper):
+    upper = candidate.upper().replace(" ", "").replace("_", "")
+    parts = [part for part in re.split(r"[-/\\+,:;]", upper) if part]
+    if not parts:
         return False
-    if not any(ch.isdigit() for ch in upper):
-        return False
-    return True
+
+    eeg_prefixes = {
+        "FP",
+        "AF",
+        "F",
+        "FC",
+        "FT",
+        "C",
+        "CP",
+        "TP",
+        "T",
+        "P",
+        "PO",
+        "O",
+        "I",
+        "PG",
+    }
+    ref_tokens = {
+        "A1",
+        "A2",
+        "M1",
+        "M2",
+        "REF",
+        "REFERENCE",
+        "AV",
+        "AVG",
+        "GND",
+        "GROUND",
+        "ROC",
+        "LOC",
+        "EOG",
+        "EKG",
+        "ECG",
+    }
+
+    def _looks_like_endpoint(token: str) -> bool:
+        cleaned = re.sub(r"\(.*?\)", "", token).strip("-")
+        if not cleaned:
+            return False
+        if cleaned in ref_tokens:
+            return True
+        if cleaned.endswith("REF") and len(cleaned) > 3:
+            cleaned = cleaned[:-3].strip("-")
+        if cleaned.endswith("Z"):
+            return cleaned[:-1] in eeg_prefixes
+        match = re.fullmatch(r"([A-Z]{1,3})(\d{1,2})", cleaned)
+        if not match:
+            return False
+        prefix, number_text = match.groups()
+        return prefix in eeg_prefixes and 1 <= int(number_text) <= 12
+
+    return all(_looks_like_endpoint(part) for part in parts)
+
+
+def canonical_event_text(event: EventItem) -> tuple[str | None, str | None, str | None]:
+    """Return canonical event text fields for downstream outputs.
+
+    Events should already be normalized by the parser/conversion pipeline.
+    This helper just returns stripped text fields for output layers.
+    """
+    event_id = event.IDStr.strip() if event.IDStr else None
+    label = event.label.strip() if event.label else None
+    annotation = event.annotation.strip() if event.annotation else None
+
+    return event_id, label, annotation
+
+
+def _normalize_event(event: EventItem, event_type_info: Mapping[str, str] | None = None) -> None:
+    if event.rawLabel is None and event.label:
+        event.rawLabel = event.label
+    if event.label == "-":
+        event.label = ""
+    if event_type_info and event.GUID in event_type_info and event.IDStr == "UNKNOWN":
+        event.IDStr = event_type_info[event.GUID]
+
+    if event.label and not any(ch.isascii() and ch.isalnum() for ch in event.label):
+        event.label = None
+    if event.IDStr == "Impedanse":
+        label_text = (event.label or "").lower()
+        if "impedance" in label_text or "impedanse" in label_text:
+            event.label = None
+    if event.IDStr == "Funn av langsom aktivitet":
+        event.IDStr = "Funn: langsom aktivitet"
+    if event.IDStr in {"Detections Active", "Detections Inactive"} and event.annotation:
+        event.label = f"{event.IDStr} - {event.annotation}"
+        event.annotation = None
+    if event.IDStr == "Funn" and event.label and _looks_like_channel_label(event.label):
+        event.label = None
+    if event.IDStr in {"UTBRUDD", "Utbrudd"}:
+        event.IDStr = "Utbrudd"
+        if event.label and _looks_like_channel_label(event.label):
+            event.label = None
+    if event.IDStr == "SW" and event.label and _looks_like_channel_label(event.label):
+        event.label = None
+    if event.IDStr == "Prune":
+        # Nicolet prune packets often carry derivation/montage text in the label
+        # field (for example "Fz-AV" or "Fp1-SFp1"). That is raw packet metadata,
+        # not the semantic event text we want to export downstream.
+        event.label = None
+    if event.label and event.IDStr:
+        if event.label in event.IDStr and len(event.label) < len(event.IDStr):
+            event.label = None
+        elif _clean_event_label(event.label).lower() == _clean_event_label(event.IDStr).lower():
+            event.label = None
+        elif event.IDStr.startswith("Funn:") and event.label.startswith("Funn av"):
+            event.label = None
+    if event.IDStr == "Seizure" and (not event.label or "Anfall" in event.label):
+        event.IDStr = "Anfall"
+    if event.IDStr == "Annotation" and not event.annotation:
+        cleaned = event.label.strip() if event.label else ""
+        if not cleaned or cleaned == "-":
+            event.IDStr = "Anmerkning"
+    if event.IDStr == "UNKNOWN":
+        cleaned = _clean_event_label(event.label or "")
+        if cleaned and cleaned != "-":
+            event.IDStr = cleaned
+        else:
+            raw = event.label.strip() if event.label else ""
+            if raw and raw != "-":
+                event.IDStr = raw
+
+
+def normalize_events(
+    events: Sequence[EventItem] | None,
+    *,
+    event_type_info: Mapping[str, str] | None = None,
+) -> list[EventItem]:
+    normalized = list(events) if events else []
+    for event in normalized:
+        _normalize_event(event, event_type_info)
+    return normalized
 
 
 def _read_event_type_info(
@@ -1161,11 +1919,17 @@ def _read_event_type_info(
     index_entries = _main_index_by_section(main_index, packet.index)
     if not index_entries:
         return {}
-    index_entry = index_entries[0]
-    handle.seek(index_entry.offset, 0)
-    buffer = _read_exact(handle, index_entry.sectionL)
     if not target_guids:
         return {}
+    blob = bytearray()
+    for entry in index_entries:
+        if entry.sectionL <= 0:
+            continue
+        handle.seek(entry.offset, 0)
+        blob.extend(_read_exact(handle, entry.sectionL))
+    if not blob:
+        return {}
+    buffer = bytes(blob)
 
     mapping: dict[str, str] = {}
     for guid in target_guids:
@@ -1189,10 +1953,11 @@ def _read_event_type_info(
 def _infer_reference(segments: list[SegmentInfo]) -> str | None:
     if not segments:
         return None
-    ref_labels = [ref for ref in segments[0].refName if ref]
+    ref_labels = [str(ref).split("\x00", 1)[0].strip() for ref in segments[0].refName if ref]
     if not ref_labels:
         return None
-    if sorted(set(ref_labels)) == ["REF"]:
+    normalized = sorted({label.upper() for label in ref_labels if label})
+    if normalized == ["REF"]:
         return "common"
     return "unknown"
 
@@ -1299,6 +2064,10 @@ def read_nervus_header(path: str | Path):
                     patient_info = _read_patient_info(handle, static_packets, main_index)
                     sig_info = _read_signal_info(handle, static_packets, main_index)
                     channel_info = _read_channel_info(handle, static_packets, main_index)
+                    input_info = _read_input_info(handle, static_packets, main_index)
+                    input_settings_info = _read_input_settings_info(
+                        handle, static_packets, main_index
+                    )
                     montage_info = _read_montage_info(handle, static_packets, main_index)
                     montage_info2 = _read_dynamic_montages(dynamic_packets)
                     ts_packets = _read_tsinfo_packets(
@@ -1312,38 +2081,7 @@ def read_nervus_header(path: str | Path):
                         main_index,
                         target_guids={event.GUID for event in events},
                     )
-                    if event_type_info:
-                        for event in events:
-                            if event.GUID in event_type_info and event.IDStr == "UNKNOWN":
-                                event.IDStr = event_type_info[event.GUID]
-                    for event in events:
-                        if event.label and not any(ch.isascii() and ch.isalnum() for ch in event.label):
-                            event.label = None
-                        if event.IDStr == "UNKNOWN":
-                            cleaned = _clean_event_label(event.label or "")
-                            if cleaned and cleaned != "-":
-                                event.IDStr = cleaned
-                            else:
-                                raw = event.label.strip() if event.label else ""
-                                if raw and raw != "-":
-                                    event.IDStr = raw
-                        if event.IDStr in {"Detections Active", "Detections Inactive"} and event.annotation:
-                            event.label = f"{event.IDStr} - {event.annotation}"
-                            event.annotation = None
-                        if event.IDStr == "Seizure" and (not event.label or "Anfall" in event.label):
-                            event.IDStr = "Anfall"
-                        if event.IDStr == "Funn" and event.label and _looks_like_channel_label(event.label):
-                            event.label = None
-                        if event.IDStr in {"UTBRUDD", "Utbrudd"}:
-                            event.IDStr = "Utbrudd"
-                            if event.label and _looks_like_channel_label(event.label):
-                                event.label = None
-                        if event.IDStr == "SW" and event.label and _looks_like_channel_label(event.label):
-                            event.label = None
-                        if event.IDStr == "Prune" and event.label:
-                            lowered = event.label.lower()
-                            if _looks_like_channel_label(event.label) or "marks epochs" in lowered:
-                                event.label = None
+                    events = normalize_events(events, event_type_info=event_type_info)
                     header = NervusHeader(
                         filename=filename,
                         StaticPackets=static_packets,
@@ -1356,6 +2094,8 @@ def read_nervus_header(path: str | Path):
                         PatientInfo=patient_info,
                         SigInfo=sig_info,
                         ChannelInfo=channel_info,
+                        InputInfo=input_info,
+                        InputSettingsInfo=input_settings_info,
                         TSInfo=ts_packets[0]["entries"] if ts_packets else [],
                         TSInfoBySegment=[_select_tsinfo_for_segment(seg.date, ts_packets) for seg in segments],
                         Segments=segments,
@@ -1389,6 +2129,8 @@ def read_nervus_header(path: str | Path):
         patient_info = _read_patient_info(handle, static_packets, main_index)
         sig_info = _read_signal_info(handle, static_packets, main_index)
         channel_info = _read_channel_info(handle, static_packets, main_index)
+        input_info = _read_input_info(handle, static_packets, main_index)
+        input_settings_info = _read_input_settings_info(handle, static_packets, main_index)
         montage_info = _read_montage_info(handle, static_packets, main_index)
         montage_info2 = _read_dynamic_montages(dynamic_packets)
         ts_packets = _read_tsinfo_packets(handle, static_packets, dynamic_packets, main_index)
@@ -1400,61 +2142,7 @@ def read_nervus_header(path: str | Path):
             main_index,
             target_guids={event.GUID for event in events},
         )
-        if event_type_info:
-            for event in events:
-                if event.label == "-":
-                    event.label = ""
-                if event.GUID in event_type_info:
-                    if event.IDStr == "UNKNOWN":
-                        event.IDStr = event_type_info[event.GUID]
-                    if not event.label and event.IDStr == "UNKNOWN":
-                        event.label = event_type_info[event.GUID]
-        for event in events:
-            if event.label and not any(ch.isascii() and ch.isalnum() for ch in event.label):
-                event.label = None
-            if event.IDStr == "Impedanse":
-                label_text = (event.label or "").lower()
-                if "impedance" in label_text or "impedanse" in label_text:
-                    event.label = None
-            if event.IDStr == "Funn av langsom aktivitet":
-                event.IDStr = "Funn: langsom aktivitet"
-            if event.IDStr in {"Detections Active", "Detections Inactive"} and event.annotation:
-                event.label = f"{event.IDStr} - {event.annotation}"
-                event.annotation = None
-            if event.IDStr == "Funn" and event.label and _looks_like_channel_label(event.label):
-                event.label = None
-            if event.IDStr in {"UTBRUDD", "Utbrudd"}:
-                event.IDStr = "Utbrudd"
-                if event.label and _looks_like_channel_label(event.label):
-                    event.label = None
-            if event.IDStr == "SW" and event.label and _looks_like_channel_label(event.label):
-                event.label = None
-            if event.IDStr == "Prune" and event.label:
-                lowered = event.label.lower()
-                if _looks_like_channel_label(event.label) or "marks epochs" in lowered:
-                    event.label = None
-            if event.label and event.IDStr:
-                if event.label in event.IDStr and len(event.label) < len(event.IDStr):
-                    event.label = None
-                elif _clean_event_label(event.label).lower() == _clean_event_label(event.IDStr).lower():
-                    event.label = None
-                elif event.IDStr.startswith("Funn:") and event.label.startswith("Funn av"):
-                    event.label = None
-            if event.IDStr == "Seizure" and (not event.label or "Anfall" in event.label):
-                event.IDStr = "Anfall"
-            if event.IDStr == "Annotation" and not event.annotation:
-                cleaned = event.label.strip() if event.label else ""
-                if not cleaned or cleaned == "-":
-                    event.IDStr = "Anmerkning"
-        for event in events:
-            if event.IDStr == "UNKNOWN":
-                cleaned = _clean_event_label(event.label or "")
-                if cleaned and cleaned != "-":
-                    event.IDStr = cleaned
-                else:
-                    raw = event.label.strip() if event.label else ""
-                    if raw and raw != "-":
-                        event.IDStr = raw
+        events = normalize_events(events, event_type_info=event_type_info)
 
     nrv_header = NervusHeader(
         filename=filename,
@@ -1468,6 +2156,8 @@ def read_nervus_header(path: str | Path):
         PatientInfo=patient_info,
         SigInfo=sig_info,
         ChannelInfo=channel_info,
+        InputInfo=input_info,
+        InputSettingsInfo=input_settings_info,
         TSInfo=ts_packets[0]["entries"] if ts_packets else [],
         TSInfoBySegment=[_select_tsinfo_for_segment(seg.date, ts_packets) for seg in segments],
         Segments=segments,

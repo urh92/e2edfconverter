@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .header import canonical_event_text
 from .types import EventItem
 
 
@@ -13,12 +14,20 @@ from .types import EventItem
 _MONTH_ABBR = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", 
                "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
+_SFREQ_INT_TOL = 1e-6
 
-def _clean_ascii(text: str | None, fallback: str, length: int) -> str:
-    """Clean text to ASCII-only, returning fallback if empty."""
-    raw = (text or fallback).encode("ascii", "ignore")[:length]
-    cleaned = raw.decode("ascii", errors="ignore").strip()
-    return cleaned or fallback[:length]
+
+def _require_integer_sampling_rate(sfreq: float) -> int:
+    """Validate that EDF output sampling rate is an integer Hz value."""
+    if not np.isfinite(sfreq) or sfreq <= 0:
+        raise ValueError("Sampling frequency must be a positive finite number")
+    rounded = int(round(float(sfreq)))
+    if rounded <= 0 or not np.isclose(float(sfreq), float(rounded), rtol=0.0, atol=_SFREQ_INT_TOL):
+        raise ValueError(
+            f"EDF output requires an integer sampling rate in Hz, got {sfreq}. "
+            "Use resampling to an integer Hz rate before writing."
+        )
+    return rounded
 
 
 def _sanitize_subfield(text: str) -> str:
@@ -164,14 +173,14 @@ def _format_event_tal(event: EventItem, recording_start: datetime) -> bytes:
     if event.duration is not None and event.duration > 0:
         duration = f"\x15{event.duration:.6f}"
     
-    # Build annotation text
+    event_id, label, annotation = canonical_event_text(event)
     description_parts = []
-    if event.label:
-        description_parts.append(event.label)
-    if event.annotation:
-        description_parts.append(event.annotation)
-    elif event.IDStr and not description_parts:
-        description_parts.append(event.IDStr)
+    if label:
+        description_parts.append(label)
+    if annotation:
+        description_parts.append(annotation)
+    elif event_id and not description_parts:
+        description_parts.append(event_id)
     text = ": ".join(part for part in description_parts if part) or "Event"
     
     # TAL format: <onset><duration>\x14<annotation>\x14\x00

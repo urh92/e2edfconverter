@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import re
 from fractions import Fraction
 from datetime import datetime, timedelta
 from collections.abc import Iterable, Sequence
@@ -14,11 +15,128 @@ import numpy as np
 
 from .data import read_nervus_data
 from .edf_writer import write_edf
-from .header import read_nervus_header
-from .types import EventItem, SegmentInfo
+from .header import canonical_event_text, normalize_events, read_nervus_header
+from .montage_recovery import (
+    DIRECT_ID_NAME_SOURCES,
+    build_montage_recovery_plan,
+    should_skip_main_direct_numeric_ref_fallback,
+)
+from .types import EventItem, NervusHeader, SegmentInfo
 from .tui import TuiOptions, rich_available, run_rich_wizard, run_tui
 
 logger = logging.getLogger(__name__)
+_SFREQ_INT_TOL = 1e-6
+_EEG_POSITION_PREFIXES = {
+    "FP",
+    "AF",
+    "F",
+    "FC",
+    "FT",
+    "C",
+    "CP",
+    "TP",
+    "T",
+    "P",
+    "PO",
+    "O",
+    "I",
+}
+_NUMERIC_REF_LABEL_RE = re.compile(r"^\d+\s*-\s*REF$", re.IGNORECASE)
+_SSE_64_NUMERIC_ID_EEG_LABELS = [
+    "FP1",
+    "FP2",
+    "AF7",
+    "AF8",
+    "AF3",
+    "AF4",
+    "F9",
+    "F10",
+    "F7",
+    "F8",
+    "F5",
+    "F6",
+    "F3",
+    "F4",
+    "F1",
+    "F2",
+    "FT9",
+    "FT10",
+    "FT7",
+    "FT8",
+    "FC3",
+    "FC4",
+    "T9",
+    "T10",
+    "T7",
+    "T8",
+    "C5",
+    "C6",
+    "C3",
+    "C4",
+    "C1",
+    "C2",
+    "TP9",
+    "TP10",
+    "TP7",
+    "TP8",
+    "CP3",
+    "CP4",
+    "P9",
+    "P10",
+    "P7",
+    "P8",
+    "P5",
+    "P6",
+    "P3",
+    "P4",
+    "P1",
+    "P2",
+    "PO7",
+    "PO8",
+    "PO3",
+    "PO4",
+    "O1",
+    "O2",
+    "FPZ",
+    "AFZ",
+    "FZ",
+    "FCZ",
+    "CZ",
+    "CPZ",
+    "PZ",
+    "POZ",
+    "OZ",
+]
+_SSE_64_NUMERIC_ID_MAP = {
+    str(index): label for index, label in enumerate(_SSE_64_NUMERIC_ID_EEG_LABELS, start=1)
+}
+_SSE_64_NUMERIC_ID_MAP["64"] = "EKG"
+
+
+def _parse_integer_hz(raw: str) -> float:
+    """argparse type parser that accepts only positive integer Hz values."""
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid sampling rate: {raw}") from exc
+    if not np.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("Sampling rate must be a positive finite value")
+    rounded = int(round(value))
+    if rounded <= 0 or not np.isclose(value, float(rounded), rtol=0.0, atol=_SFREQ_INT_TOL):
+        raise argparse.ArgumentTypeError(
+            "Sampling rate for EDF output must be an integer Hz value (e.g. 128, 256, 512)"
+        )
+    return float(rounded)
+
+
+def _require_integer_output_rate(fs: float, *, context: str) -> None:
+    rounded = int(round(float(fs)))
+    if rounded > 0 and np.isclose(float(fs), float(rounded), rtol=0.0, atol=_SFREQ_INT_TOL):
+        return
+    raise RuntimeError(
+        f"{context} sampling rate is {fs} Hz, but EDF output currently requires integer Hz. "
+        "Use --resample-to <integer Hz>."
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,8 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--resample-to",
-        type=float,
-        help="Optional sampling rate (Hz) to resample the output EDF to (requires scipy)",
+        type=_parse_integer_hz,
+        help="Optional integer sampling rate (Hz) for EDF output (requires scipy)",
     )
     parser.add_argument(
         "--lowcut",
@@ -217,18 +335,471 @@ def _candidate_output_path(input_path: Path, output_dir: Path, input_root: Path 
     return output_dir / f"{input_path.stem}.edf"
 
 
+def _clean_channel_label(label: object) -> str:
+    cleaned = str(label or "").split("\x00", 1)[0].strip()
+    return cleaned
+
+
+def _channel_match_key(label: object) -> str:
+    return _clean_channel_label(label).upper().replace(" ", "").replace("_", "")
+
+
+def _normalize_eeg_position(label: object) -> str | None:
+    token = _clean_channel_label(label).upper()
+    if not token:
+        return None
+
+    token = token.replace("EEG", "", 1) if token.startswith("EEG ") else token
+    token = token.replace(" ", "").replace("_", "")
+    if token.endswith("-REF"):
+        token = token[:-4]
+    elif token.endswith("REF") and len(token) > 3:
+        token = token[:-3]
+    token = token.strip("-")
+
+    if token in {"A1", "A2", "REF", "REFERENCE", "GROUND", "GND"}:
+        return None
+    if token == "IZ":
+        return token
+
+    if token.endswith("Z"):
+        prefix = token[:-1]
+        if prefix in _EEG_POSITION_PREFIXES:
+            return token
+        return None
+
+    match = re.fullmatch(r"([A-Z]{1,3})(\d{1,2})", token)
+    if not match:
+        return None
+    prefix, number_text = match.groups()
+    if prefix not in _EEG_POSITION_PREFIXES:
+        return None
+    number = int(number_text)
+    if 1 <= number <= 12:
+        return f"{prefix}{number}"
+    return None
+
+
+def _extract_eeg_label_from_derivation(derivation_name: object) -> str | None:
+    raw = _clean_channel_label(derivation_name)
+    if not raw:
+        return None
+    lhs = re.split(r"[-/\\+,:;]", raw, maxsplit=1)[0]
+
+    for part in (lhs, raw):
+        normalized = _normalize_eeg_position(part)
+        if normalized:
+            return normalized
+        for token in re.findall(r"[A-Za-z]{1,4}\s*\d{0,2}[A-Za-z]?", part):
+            normalized = _normalize_eeg_position(token)
+            if normalized:
+                return normalized
+    return None
+
+
+def _normalize_derivation_endpoint(token: str) -> str | None:
+    cleaned = _clean_channel_label(token).upper().replace(" ", "").replace("_", "")
+    if not cleaned:
+        return None
+    # Derivation labels may include legacy aliases in parentheses, e.g. T7(T3).
+    cleaned = re.sub(r"\(.*?\)", "", cleaned).strip()
+    if not cleaned:
+        return None
+    # Legacy derivation strings sometimes use 01/02 for occipitals.
+    if cleaned == "01":
+        return "O1"
+    if cleaned == "02":
+        return "O2"
+    return _normalize_eeg_position(cleaned)
+
+
+def _extract_eeg_endpoints_from_derivation(derivation_name: object) -> tuple[str | None, str | None]:
+    raw = _clean_channel_label(derivation_name)
+    if not raw:
+        return None, None
+    if "-" not in raw:
+        return _extract_eeg_label_from_derivation(raw), None
+    left_raw, right_raw = raw.split("-", 1)
+    left = _normalize_derivation_endpoint(left_raw)
+    right = _normalize_derivation_endpoint(right_raw)
+    return left, right
+
+
+def _extract_non_eeg_single_derivation_label(derivation_name: object) -> str | None:
+    raw = _clean_channel_label(derivation_name)
+    if not raw or "-" in raw:
+        return None
+    candidate = raw.upper()
+    if _categorize_channel(candidate) in {"EKG", "EOG", "Reference", "Stimulus"}:
+        return candidate
+    return None
+
+
+def _add_mapping_with_conflict_tracking(
+    mapping: dict[str, str],
+    conflicts: set[str],
+    signal_name: str,
+    electrode_name: str | None,
+) -> None:
+    if not signal_name or not electrode_name:
+        return
+    key = _channel_match_key(signal_name)
+    previous = mapping.get(key)
+    if previous and previous != electrode_name:
+        conflicts.add(key)
+        return
+    mapping[key] = electrode_name
+
+
+def _is_numeric_style_channel_label(label: str) -> bool:
+    cleaned = _clean_channel_label(label)
+    if not cleaned:
+        return False
+    return bool(re.fullmatch(r"[0-9]+", cleaned) or _NUMERIC_REF_LABEL_RE.fullmatch(cleaned))
+
+
+def _is_sse_source_recording(header: object) -> bool:
+    filename = getattr(header, "filename", None)
+    if not filename:
+        return False
+    path_text = str(filename).replace("\\", "/").upper()
+    return "/SSE/" in path_text or "SSE-ARKIV" in path_text
+
+
+def _extract_numeric_placeholder_id(label: object) -> str | None:
+    cleaned = _clean_channel_label(label)
+    if not cleaned:
+        return None
+    if cleaned.isdigit():
+        return str(int(cleaned))
+    match = _NUMERIC_REF_LABEL_RE.fullmatch(cleaned.upper())
+    if not match:
+        return None
+    return str(int(cleaned.split("-", 1)[0].strip()))
+
+
+def _recover_sse_64_numeric_id_labels(header: object, channel_labels: list[str]) -> list[str] | None:
+    """Apply a fixed SSE 64-contact numeric-ID map (63 EEG + channel ID 64 = EKG).
+
+    This is intentionally strict and only triggers for in-house SSE recordings
+    whose channel labels are an exact permutation of placeholder IDs 1..64
+    (optionally in ``N-Ref`` form).
+    """
+    if len(channel_labels) != 64:
+        return None
+    if not _is_sse_source_recording(header):
+        return None
+
+    ids: list[str] = []
+    for label in channel_labels:
+        numeric_id = _extract_numeric_placeholder_id(label)
+        if numeric_id is None:
+            return None
+        if numeric_id not in _SSE_64_NUMERIC_ID_MAP:
+            return None
+        ids.append(numeric_id)
+
+    expected_ids = {str(i) for i in range(1, 65)}
+    if set(ids) != expected_ids or len(set(ids)) != 64:
+        return None
+
+    recovered = [_SSE_64_NUMERIC_ID_MAP[numeric_id] for numeric_id in ids]
+    logger.info("Applied SSE fixed 64-channel numeric-ID mapping (63 EEG + EKG)")
+    return recovered
+
+
+def _should_attempt_numeric_montage_recovery(channel_labels: list[str]) -> bool:
+    """Return True when montage-based relabeling is likely to be beneficial.
+
+    The recovery step only replaces placeholder labels (numeric / ``N-Ref``),
+    so this gate is intentionally permissive when placeholders dominate even if
+    a small number of named non-EEG channels are present.
+    """
+    if not channel_labels:
+        return False
+
+    non_aux = [
+        label
+        for label in channel_labels
+        if _categorize_channel(label) in {"Other", "EEG"}
+    ]
+    if not non_aux:
+        return False
+
+    numeric_count = sum(1 for label in non_aux if _is_numeric_style_channel_label(label))
+    if numeric_count == 0:
+        return False
+
+    # If we already have explicit non-numeric non-EEG labels (e.g. VST 01,
+    # matte 01), this is often not the numeric-ID failure mode. However some
+    # recordings have a single named auxiliary/marker channel plus a large block
+    # of numeric EEG contacts; in that case recovery is still appropriate.
+    non_numeric_other = [
+        label
+        for label in non_aux
+        if _categorize_channel(label) == "Other" and not _is_numeric_style_channel_label(label)
+    ]
+    if non_numeric_other and (numeric_count / max(1, len(non_aux))) < 0.75:
+        return False
+
+    # Primary target: all labels are numeric-style.
+    if numeric_count == len(non_aux):
+        return True
+
+    # Also recover partial cases where labels are predominantly numeric and only
+    # a subset already resolved as EEG.
+    threshold = max(2, (len(non_aux) + 1) // 2)
+    return numeric_count >= threshold
+
+
+def _recover_channel_labels_from_montage(header, channel_labels: list[str]) -> list[str]:
+    """Recover numeric placeholder labels using available montage metadata."""
+    if not channel_labels:
+        return channel_labels
+    if not _should_attempt_numeric_montage_recovery(channel_labels):
+        return channel_labels
+
+    sse_fixed_map_recovery = _recover_sse_64_numeric_id_labels(header, channel_labels)
+    if sse_fixed_map_recovery is not None:
+        return sse_fixed_map_recovery
+
+    montage_entries = getattr(header, "MontageInfo", None) or []
+    if not montage_entries:
+        return channel_labels
+
+    recovery_plan = build_montage_recovery_plan(montage_entries, channel_labels)
+    primary_entries = recovery_plan.primary_entries
+    aux_entries = recovery_plan.auxiliary_entries
+    has_unknown_catalog = recovery_plan.has_unknown_catalog
+
+    signal_to_electrode: dict[str, str] = {}
+    conflicts: set[str] = set()
+
+    def _collect_mappings(
+        entries: list[dict[str, object]],
+        mapping: dict[str, str],
+        mapping_conflicts: set[str],
+    ) -> None:
+        for entry in entries:
+            signal_name = _clean_channel_label(entry.get("signalName1", ""))
+            signal_name_2 = _clean_channel_label(entry.get("signalName2", ""))
+            derivation_name = entry.get("derivationName", "")
+            source = str(entry.get("source", ""))
+            if not signal_name or not derivation_name:
+                continue
+            if source in DIRECT_ID_NAME_SOURCES:
+                fixed_name = _clean_channel_label(derivation_name)
+                fixed_upper = fixed_name.upper()
+                # Only treat these sources as direct ID->name tables when the
+                # row label is a simple contact/electrode name. Some fixed
+                # DERIVATION tables contain derivation labels (e.g. "Fp2-av")
+                # that must be parsed as endpoints instead.
+                direct_name_usable = True
+                if source == "derivation_fixed_table" and any(
+                    sep in fixed_name for sep in ("-", "/", "\\", "+", ":")
+                ):
+                    direct_name_usable = False
+                # Hidden catalogs can contain placeholder rows (AV/REF) mixed
+                # with useful labels. Do not use those as final channel names.
+                if source == "unknown_montage_catalog" and (
+                    fixed_upper in {"AV", "REF", "REFERENCE"}
+                    or _NUMERIC_REF_LABEL_RE.fullmatch(fixed_upper)
+                ):
+                    direct_name_usable = False
+                if source == "unknown_montage_catalog" and any(
+                    sep in fixed_name for sep in ("-", "/", "\\", "+", ":")
+                ):
+                    # Hidden catalogs can include derived rows such as "Fp2-av".
+                    # Keep those out of direct ID->contact mapping.
+                    direct_name_usable = False
+                if direct_name_usable:
+                    # Fixed tables may legitimately contain numeric contact labels
+                    # (e.g. depth contacts "1..32"), so we allow both numeric and
+                    # non-numeric names here and let identity mappings be harmless.
+                    _add_mapping_with_conflict_tracking(
+                        mapping, mapping_conflicts, signal_name, fixed_name or None
+                    )
+                    continue
+                if source == "unknown_montage_catalog" and any(
+                    sep in fixed_name for sep in ("-", "/", "\\", "+", ":")
+                ):
+                    # For hidden catalogs, derived labels are noisy and can map
+                    # placeholders to the wrong endpoint if we parse them as
+                    # pair derivations. Skip these rows entirely.
+                    continue
+            left, right = _extract_eeg_endpoints_from_derivation(derivation_name)
+            if left is None:
+                left = _extract_non_eeg_single_derivation_label(derivation_name)
+            if (
+                left is None
+                and source == "derivation_main_table"
+                and not signal_name_2
+            ):
+                # Main DERIVATION tables in some recordings contain direct
+                # signal-ID -> channel-name rows (e.g. VTP1, HST3, F3, CZ)
+                # rather than pair derivations. Use the row name directly.
+                direct_name = _clean_channel_label(derivation_name)
+                if should_skip_main_direct_numeric_ref_fallback(
+                    source, direct_name, has_unknown_catalog=has_unknown_catalog
+                ):
+                    direct_name = ""
+                left = direct_name or None
+            _add_mapping_with_conflict_tracking(mapping, mapping_conflicts, signal_name, left)
+            # Some numeric channels only appear as signalName2 (right endpoint).
+            if signal_name_2 and signal_name_2.isdigit():
+                _add_mapping_with_conflict_tracking(
+                    mapping, mapping_conflicts, signal_name_2, right
+                )
+
+    # Primary montage rows define the authoritative mapping.
+    _collect_mappings(primary_entries, signal_to_electrode, conflicts)
+    for key in conflicts:
+        signal_to_electrode.pop(key, None)
+
+    # Auxiliary rows (e.g. hidden input-montage tables) only fill gaps and
+    # never override primary mappings.
+    if aux_entries:
+        def _aux_group_key(entry: dict[str, object]) -> tuple[str, str]:
+            source = str(entry.get("source", ""))
+            if source == "unknown_montage_catalog":
+                return source, str(entry.get("montageName", "") or "")
+            return source, ""
+
+        grouped_aux_entries: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for entry in aux_entries:
+            key = _aux_group_key(entry)
+            if key not in grouped_aux_entries:
+                grouped_aux_entries[key] = []
+            grouped_aux_entries[key].append(entry)
+
+        for group_entries in grouped_aux_entries.values():
+            aux_mapping: dict[str, str] = {}
+            aux_conflicts: set[str] = set()
+            _collect_mappings(group_entries, aux_mapping, aux_conflicts)
+            for key in aux_conflicts:
+                aux_mapping.pop(key, None)
+            for key, value in aux_mapping.items():
+                if key not in signal_to_electrode:
+                    signal_to_electrode[key] = value
+
+    if not signal_to_electrode:
+        return channel_labels
+
+    recovered_labels: list[str] = []
+    replaced = 0
+    for label in channel_labels:
+        cleaned = _clean_channel_label(label)
+        normalized = _normalize_eeg_position(cleaned)
+        if normalized:
+            recovered_labels.append(normalized)
+            continue
+        mapped = signal_to_electrode.get(_channel_match_key(cleaned))
+        is_placeholder = bool(cleaned.isdigit() or _NUMERIC_REF_LABEL_RE.fullmatch(cleaned.upper()))
+        if mapped and is_placeholder:
+            recovered_labels.append(mapped)
+            replaced += 1
+        else:
+            recovered_labels.append(cleaned)
+
+    eeg_before = sum(1 for label in channel_labels if _categorize_channel(label) == "EEG")
+    eeg_after = sum(1 for label in recovered_labels if _categorize_channel(label) == "EEG")
+    if eeg_after < eeg_before:
+        return channel_labels
+    if replaced > 0:
+        logger.debug(
+            "Montage recovery source counts=%s source_scores=%s catalog_scores=%s",
+            recovery_plan.source_counts,
+            recovery_plan.source_scores,
+            recovery_plan.catalog_scores,
+        )
+        logger.info(
+            "Recovered %d/%d channel labels from montage derivations",
+            replaced,
+            len(channel_labels),
+        )
+    return recovered_labels
+
+
 def _channel_labels(header, channels: Iterable[int]) -> list[str]:
+    channel_list = list(channels)
     labels = header.Segments[0].chName if header.Segments else []
     resolved: list[str] = []
-    for channel in channels:
+    for channel in channel_list:
         zero_based = channel - 1
         try:
             label = labels[zero_based]
         except (IndexError, TypeError):
             label = f"Ch{channel}"
-        cleaned = label.split("\x00", 1)[0].strip()
+        cleaned = _clean_channel_label(label)
         resolved.append(cleaned or f"Ch{channel}")
-    return resolved
+    return _disambiguate_duplicate_channel_labels(header, channel_list, resolved)
+
+
+def _channel_references(header, channels: list[int]) -> list[str]:
+    segment_refs = header.Segments[0].refName if header.Segments else []
+    ts_entries = header.TSInfo or []
+    references: list[str] = []
+    for channel in channels:
+        zero_based = channel - 1
+        ref_label = ""
+        try:
+            ref_label = segment_refs[zero_based]
+        except (IndexError, TypeError):
+            ref_label = ""
+        cleaned = _clean_channel_label(ref_label)
+        if not cleaned and 0 <= zero_based < len(ts_entries):
+            cleaned = _clean_channel_label(getattr(ts_entries[zero_based], "refSensor", ""))
+        references.append(cleaned)
+    return references
+
+
+def _ensure_unique_labels(channel_labels: list[str]) -> list[str]:
+    unique_labels: list[str] = []
+    used: set[str] = set()
+    next_suffix: dict[str, int] = {}
+
+    for label in channel_labels:
+        base = _clean_channel_label(label) or "Ch"
+        candidate = base
+        suffix = next_suffix.get(base, 2)
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        next_suffix[base] = suffix
+        used.add(candidate)
+        unique_labels.append(candidate)
+    return unique_labels
+
+
+def _disambiguate_duplicate_channel_labels(
+    header,
+    channels: list[int],
+    channel_labels: list[str],
+) -> list[str]:
+    if not channel_labels:
+        return channel_labels
+
+    label_positions: dict[str, list[int]] = {}
+    for idx, label in enumerate(channel_labels):
+        label_positions.setdefault(label, []).append(idx)
+
+    duplicates = {label: idxs for label, idxs in label_positions.items() if len(idxs) > 1}
+    if not duplicates:
+        return channel_labels
+
+    references = _channel_references(header, channels)
+    resolved = list(channel_labels)
+
+    for label, idxs in duplicates.items():
+        refs_for_label = {_clean_channel_label(references[idx]).upper() for idx in idxs if references[idx]}
+        if len(refs_for_label) < 2:
+            continue
+        for idx in idxs:
+            ref = _clean_channel_label(references[idx])
+            if ref:
+                resolved[idx] = f"{label}-{ref}"
+
+    return _ensure_unique_labels(resolved)
 
 
 def _select_channels(header, *, include_all: bool = False) -> list[int]:
@@ -252,12 +823,6 @@ def _select_channels(header, *, include_all: bool = False) -> list[int]:
     if header.Segments and header.Segments[0].chName:
         return list(range(1, len(header.Segments[0].chName) + 1))
     return []
-
-
-def _recording_duration_seconds(header) -> float:
-    if not header.Segments:
-        return 0.0
-    return float(sum(segment.duration for segment in header.Segments if segment.duration))
 
 
 def _channel_rate_and_variation(header, channel_zero_based: int) -> tuple[float | None, bool]:
@@ -645,7 +1210,7 @@ def _bandpass_filter(
         b, a = butter(order, high, btype="low")
     
     # Apply zero-phase filtering to each channel
-    n_samples, n_channels = waveform.shape
+    _, n_channels = waveform.shape
     filtered = np.zeros_like(waveform)
     for idx in range(n_channels):
         filtered[:, idx] = filtfilt(b, a, waveform[:, idx])
@@ -690,7 +1255,7 @@ def _notch_filter(
     b, a = iirnotch(w0, quality_factor)
     
     # Apply zero-phase filtering to each channel
-    n_samples, n_channels = waveform.shape
+    _, n_channels = waveform.shape
     filtered = np.zeros_like(waveform)
     for idx in range(n_channels):
         filtered[:, idx] = filtfilt(b, a, waveform[:, idx])
@@ -733,45 +1298,51 @@ def _apply_ecg_polarity_correction(
 
 def _categorize_channel(label: str) -> str:
     """Categorize a channel label into a type based on naming conventions."""
-    label_upper = label.upper().strip()
+    label_upper = _clean_channel_label(label).upper()
+    base_label = re.sub(r"_\d+$", "", label_upper)
     
     # EOG (electrooculogram) channels
-    if label_upper in ("ROC", "LOC", "EOG", "HEOG", "VEOG", "LEOG", "REOG"):
+    if base_label in ("ROC", "LOC", "EOG", "HEOG", "VEOG", "LEOG", "REOG"):
         return "EOG"
     
     # EKG/ECG (electrocardiogram) channels
-    if label_upper in ("EKG", "ECG"):
+    if base_label in ("EKG", "ECG"):
         return "EKG"
     
     # Stimulus/trigger channels
-    if label_upper in ("PHOTIC", "STIM", "TRIGGER", "TRIG"):
+    if base_label in ("PHOTIC", "STIM", "TRIGGER", "TRIG"):
         return "Stimulus"
     
     # Reference channels (ear references, not midline EEG)
-    if label_upper in ("A1", "A2", "REF", "REFERENCE", "GROUND", "GND"):
+    if base_label in ("A1", "A2", "REF", "REFERENCE", "GROUND", "GND"):
         return "Reference"
+
+    # Common EEG variants not covered by the standard position normalizer.
+    # Pg1/Pg2 are posterior electrodes that appear in real KNF files.
+    if base_label in ("PG1", "PG2"):
+        return "EEG"
     
-    # Standard 10-20 EEG electrode positions
-    # Pattern: Letter(s) + optional number + optional letter (including midline Z)
-    eeg_patterns = ["FP", "F", "C", "P", "O", "T"]
-    if any(label_upper.startswith(prefix) for prefix in eeg_patterns):
-        # Check if it's a valid EEG position (has a number or is a midline Z)
-        if any(char.isdigit() for char in label_upper) or label_upper.endswith("Z"):
-            return "EEG"
+    if _normalize_eeg_position(base_label):
+        return "EEG"
+    if _extract_eeg_label_from_derivation(base_label):
+        return "EEG"
     
     # If we can't categorize it, it's "Other"
     return "Other"
 
 
-def _build_channels_list(channel_labels: list[str]) -> list[dict[str, object]]:
+def _build_channels_list(
+    channel_labels: list[str],
+) -> list[dict[str, object]]:
     """Build a flat list of channels with type info for easy DataFrame conversion."""
     channels = []
     for idx, label in enumerate(channel_labels):
-        channels.append({
+        item = {
             "index": idx,
             "name": label,
             "type": _categorize_channel(label),
-        })
+        }
+        channels.append(item)
     return channels
 
 
@@ -791,9 +1362,9 @@ def _write_json_sidecar(
     sampling_rate: float,
     channel_labels: list[str],
     sample_count: int,
-    start_time,
-    events,
-    nrv_header,
+    start_time: datetime | None,
+    events: Sequence[EventItem] | None,
+    nrv_header: NervusHeader,
 ) -> None:
     """Write ML-friendly JSON sidecar with recording metadata.
     
@@ -821,11 +1392,11 @@ def _write_json_sidecar(
             if start_time and event.date:
                 onset = (event.date - start_time).total_seconds()
             
-            label = event.label.strip() if event.label else None
+            event_id, label, annotation = canonical_event_text(event)
             
             # Separate annotations (with text) from system events
-            if event.annotation:
-                clean_text = event.annotation.strip()
+            if annotation:
+                clean_text = annotation.strip()
                 if clean_text:
                     annotations.append({
                         "onset_seconds": onset,
@@ -835,14 +1406,14 @@ def _write_json_sidecar(
             else:
                 # Skip noisy events: UNKNOWN type with placeholder label "-" or no label
                 # These are typically review/selection markers without clinical value
-                if event.IDStr == "UNKNOWN" and (label == "-" or label is None):
+                if event_id == "UNKNOWN" and (label == "-" or label is None):
                     continue
                 
                 # For meaningful system events, don't include user (reduces noise)
                 system_events.append({
                     "onset_seconds": onset,
                     "duration_seconds": event.duration if event.duration else None,
-                    "type": event.IDStr,
+                    "type": event_id,
                     "label": label if label != "-" else None,
                 })
     
@@ -872,7 +1443,6 @@ def _write_json_sidecar(
         "reference": nrv_header.reference,
         "n_segments": len(nrv_header.Segments) if nrv_header.Segments else 0,
         "excluded_channels": nrv_header.excludedChannels if nrv_header.excludedChannels else [],
-        
         # ===== Clinical annotations (for NLP/labeling) =====
         "annotations": annotations,
         "annotation_count": len(annotations),
@@ -963,6 +1533,7 @@ def _adjust_events_for_gaps(
                 annotation=event.annotation,
                 segmentIndex=event.segmentIndex,
                 isEpoch=event.isEpoch,
+                rawLabel=event.rawLabel,
             )
         )
         key = (event_id, round(onset, 3), event_label or "")
@@ -995,6 +1566,9 @@ def convert_file(
     fs = public_header.get("Fs") or nrv_header.targetSamplingRate
     if not fs:
         raise RuntimeError("Unable to determine sampling frequency from header")
+    fs = float(fs)
+    if resample_to is None:
+        _require_integer_output_rate(fs, context="Input")
 
     channels = _select_channels(nrv_header, include_all=True)
     if not channels:
@@ -1004,6 +1578,7 @@ def convert_file(
         status_cb("read data")
     channel_labels = _channel_labels(nrv_header, channels)
     ecg_indices = _ecg_channel_indices(channel_labels)
+    recovered_channel_labels = _recover_channel_labels_from_montage(nrv_header, channel_labels)
     mixed_across_channels, mixed_over_time = _sampling_rate_variation(nrv_header, channels)
     if resample_to is not None and mixed_over_time:
         logger.warning(
@@ -1024,6 +1599,8 @@ def convert_file(
                 ch0 = channels[0] - 1
                 if ch0 < len(segment.samplingRate):
                     seg_fs = float(segment.samplingRate[ch0])
+            if resample_to is None:
+                _require_integer_output_rate(seg_fs, context=f"Segment {seg_idx + 1}")
             if resample_to is not None:
                 if status_cb:
                     status_cb(f"resample (segment {seg_idx + 1}/{len(segments)})")
@@ -1042,6 +1619,7 @@ def convert_file(
             segment_events = _segment_events(nrv_header.Events, segment, seg_idx)
             if vendor_style:
                 segment_events = _filter_vendor_events(segment_events)
+            segment_events = normalize_events(segment_events)
             segment_output = _segment_output_path(resolved_output, seg_idx, len(segments))
             segment_start = segment.date or nrv_header.startDateTime
             if status_cb:
@@ -1050,7 +1628,7 @@ def convert_file(
                 segment_output,
                 seg_waveform,
                 seg_fs,
-                channel_labels,
+                recovered_channel_labels,
                 patient_meta,
                 recording_start=segment_start,
                 annotations=segment_events,
@@ -1062,7 +1640,7 @@ def convert_file(
                     segment_output,
                     source_path=input_path,
                     sampling_rate=seg_fs,
-                    channel_labels=channel_labels,
+                    channel_labels=recovered_channel_labels,
                     sample_count=seg_waveform.shape[0],
                     start_time=segment_start,
                     events=segment_events,
@@ -1101,10 +1679,11 @@ def convert_file(
         )
         if vendor_style:
             adjusted_events = _filter_vendor_events(adjusted_events)
+        adjusted_events = normalize_events(adjusted_events)
         if status_cb:
             status_cb("write edf")
         write_edf(
-            resolved_output, waveform, fs, channel_labels, patient_meta,
+            resolved_output, waveform, fs, recovered_channel_labels, patient_meta,
             recording_start=nrv_header.startDateTime, annotations=adjusted_events,
         )
         edf_fs: float | list[float] = fs
@@ -1138,10 +1717,11 @@ def convert_file(
         )
         if vendor_style:
             adjusted_events = _filter_vendor_events(adjusted_events)
+        adjusted_events = normalize_events(adjusted_events)
         if status_cb:
             status_cb("write edf")
         write_edf(
-            resolved_output, ch_data_list, ch_rate_list, channel_labels, patient_meta,
+            resolved_output, ch_data_list, ch_rate_list, recovered_channel_labels, patient_meta,
             recording_start=nrv_header.startDateTime, annotations=adjusted_events,
         )
         edf_fs = ch_rate_list
@@ -1173,10 +1753,11 @@ def convert_file(
         )
         if vendor_style:
             adjusted_events = _filter_vendor_events(adjusted_events)
+        adjusted_events = normalize_events(adjusted_events)
         if status_cb:
             status_cb("write edf")
         write_edf(
-            resolved_output, waveform, fs, channel_labels, patient_meta,
+            resolved_output, waveform, fs, recovered_channel_labels, patient_meta,
             recording_start=nrv_header.startDateTime, annotations=adjusted_events,
         )
         edf_fs = fs
@@ -1189,7 +1770,7 @@ def convert_file(
             resolved_output,
             source_path=input_path,
             sampling_rate=edf_fs if isinstance(edf_fs, float) else edf_fs[0],
-            channel_labels=channel_labels,
+            channel_labels=recovered_channel_labels,
             sample_count=edf_sample_count,
             start_time=nrv_header.startDateTime,
             events=adjusted_events,
@@ -1199,7 +1780,7 @@ def convert_file(
         "Converted %s → %s (%d channels @ %.2f Hz)",
         input_path.name,
         resolved_output.name,
-        len(channel_labels),
+        len(recovered_channel_labels),
         fs,
     )
     return resolved_output

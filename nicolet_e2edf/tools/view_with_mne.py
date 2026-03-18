@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable
@@ -21,7 +21,7 @@ def _clean_label(label: str) -> str:
     return text or "Ch"
 
 
-def _build_annotations(nrv_header, fs: float) -> mne.Annotations | None:
+def _build_annotations(nrv_header) -> mne.Annotations | None:
     import mne
 
     if not nrv_header.Events or not nrv_header.startDateTime:
@@ -80,7 +80,7 @@ def launch_viewer(path: Path, start: float, duration: float, channels: Iterable[
     info = mne.create_info(ch_names=labels, sfreq=fs, ch_types=["eeg"] * len(labels))
     raw = mne.io.RawArray(data, info, verbose=False)
 
-    annotations = _build_annotations(nrv_header, fs)
+    annotations = _build_annotations(nrv_header)
     if annotations is not None:
         raw.set_annotations(annotations)
 
