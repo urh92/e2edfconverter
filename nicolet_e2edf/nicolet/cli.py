@@ -21,7 +21,7 @@ from .montage_recovery import (
     build_montage_recovery_plan,
     should_skip_main_direct_numeric_ref_fallback,
 )
-from .types import EventItem, NervusHeader, SegmentInfo
+from .types import EventItem, NervusHeader, SegmentInfo, SleepScoreInfo
 from .tui import TuiOptions, rich_available, run_rich_wizard, run_tui
 
 logger = logging.getLogger(__name__)
@@ -1024,6 +1024,48 @@ def _segment_events(
     return selected
 
 
+_SLEEP_STAGE_NAMES = {
+    0: "Sleep stage W",
+    1: "Sleep stage N1",
+    2: "Sleep stage N2",
+    3: "Sleep stage N3",
+    4: "Sleep stage N3",  # R&K stage 4 → AASM N3
+    5: "Sleep stage R",
+}
+
+
+def _sleep_stage_events(
+    sleep_scores: list[SleepScoreInfo],
+    recording_start: datetime,
+) -> list[EventItem]:
+    """Convert the primary hypnogram to a list of EventItems for EDF+ export."""
+    if not sleep_scores or recording_start is None:
+        return []
+    primary = sleep_scores[0]
+    events: list[EventItem] = []
+    for epoch in primary.epochs:
+        onset_s = (epoch.index - 1) * epoch.duration
+        try:
+            epoch_dt = recording_start + timedelta(seconds=onset_s)
+        except (OverflowError, ValueError):
+            logger.warning("Skipping sleep epoch %d: onset %ds out of range", epoch.index, onset_s)
+            continue
+        label = _SLEEP_STAGE_NAMES.get(epoch.stage, f"Sleep stage {epoch.stage}")
+        events.append(
+            EventItem(
+                dateOLE=0.0,
+                dateFraction=0.0,
+                date=epoch_dt,
+                duration=float(epoch.duration),
+                user="",
+                GUID="",
+                label=label,
+                IDStr="",
+            )
+        )
+    return events
+
+
 def _segment_output_path(base_output: Path, seg_idx: int, seg_count: int) -> Path:
     if seg_count <= 1:
         return base_output
@@ -1622,6 +1664,11 @@ def convert_file(
             segment_events = normalize_events(segment_events)
             segment_output = _segment_output_path(resolved_output, seg_idx, len(segments))
             segment_start = segment.date or nrv_header.startDateTime
+            sleep_events = _sleep_stage_events(nrv_header.SleepScores, nrv_header.startDateTime)
+            if sleep_events and segment_start and segment.duration:
+                seg_end = segment_start + timedelta(seconds=float(segment.duration))
+                sleep_events = [e for e in sleep_events if segment_start <= e.date < seg_end]
+            segment_events = list(segment_events) + sleep_events
             if status_cb:
                 status_cb(f"write edf (segment {seg_idx + 1}/{len(segments)})")
             write_edf(
@@ -1680,6 +1727,7 @@ def convert_file(
         if vendor_style:
             adjusted_events = _filter_vendor_events(adjusted_events)
         adjusted_events = normalize_events(adjusted_events)
+        adjusted_events = list(adjusted_events) + _sleep_stage_events(nrv_header.SleepScores, nrv_header.startDateTime)
         if status_cb:
             status_cb("write edf")
         write_edf(
@@ -1718,6 +1766,7 @@ def convert_file(
         if vendor_style:
             adjusted_events = _filter_vendor_events(adjusted_events)
         adjusted_events = normalize_events(adjusted_events)
+        adjusted_events = list(adjusted_events) + _sleep_stage_events(nrv_header.SleepScores, nrv_header.startDateTime)
         if status_cb:
             status_cb("write edf")
         write_edf(
@@ -1754,6 +1803,7 @@ def convert_file(
         if vendor_style:
             adjusted_events = _filter_vendor_events(adjusted_events)
         adjusted_events = normalize_events(adjusted_events)
+        adjusted_events = list(adjusted_events) + _sleep_stage_events(nrv_header.SleepScores, nrv_header.startDateTime)
         if status_cb:
             status_cb("write edf")
         write_edf(

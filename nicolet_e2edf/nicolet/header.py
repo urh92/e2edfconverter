@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import struct
 import re
 from io import BytesIO
@@ -13,9 +14,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO
 
+logger = logging.getLogger(__name__)
+
 import numpy as np
 
-from .types import EventItem, MainIndexEntry, NervusHeader, SegmentInfo, StaticPacket, TSEntry
+from .types import EventItem, MainIndexEntry, NervusHeader, SegmentInfo, SleepEpoch, SleepScoreInfo, StaticPacket, TSEntry
 
 # ---------------------------------------------------------------------------
 # Constants and simple helpers
@@ -2020,6 +2023,104 @@ def _build_public_header(nrv_header: NervusHeader) -> dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
+# Hypnogram (sleep stage) extraction
+# ---------------------------------------------------------------------------
+
+_HYPNO_RECORD = struct.Struct("<III")  # stage_code, epoch_duration_s, epoch_index_1based
+
+
+def _try_parse_hypno(data: bytes) -> SleepScoreInfo | None:
+    """Try to interpret a raw blob as a Nicolet sleep-stage hypnogram.
+
+    The format (reverse-engineered) is:
+      Header: u32[0]=scorer_index (0=primary, 1=secondary), u32[1]=metadata (varies by
+              Nicolet version: number of stage types OR epoch duration in seconds),
+              u32[2]=start_epoch_offset (0 for a complete recording-start hypnogram)
+      Records: for each epoch, u32 stage_code, u32 duration_s, u32 epoch_index  (12 bytes each)
+
+    Stage codes: 0=Wake, 1=N1, 2=N2, 3=N3, 4=N4(R&K), 5=REM.
+
+    A complete hypnogram always has h2=0 (epochs start from index 1). Partial or
+    in-progress scorings have h2>0 (the epoch offset where scoring started), which
+    are excluded here.
+    """
+    if len(data) < 24:  # at least header + one record
+        return None
+    _h0, _h1, h2 = struct.unpack_from("<III", data, 0)
+    if h2 != 0:
+        return None
+    record_data = data[12:]
+    if len(record_data) % 12 != 0:
+        return None
+    n_records = len(record_data) // 12
+    if n_records < 1:
+        return None
+    epochs: list[SleepEpoch] = []
+    thirty_count = 0
+    for i in range(n_records):
+        stage, dur, epoch_idx = _HYPNO_RECORD.unpack_from(record_data, i * 12)
+        if stage > 7 or dur < 1 or dur > 300 or epoch_idx < 1:
+            return None
+        if dur == 30:
+            thirty_count += 1
+        epochs.append(SleepEpoch(stage=stage, duration=dur, index=epoch_idx))
+    # At least half of epochs should be 30-second epochs (last epoch may be shorter)
+    if n_records >= 10 and thirty_count < n_records * 0.5:
+        return None
+    return SleepScoreInfo(algorithm="", epoch_duration=30, epochs=epochs)
+
+
+def _read_hypnogram(
+    handle: BinaryIO,
+    static_packets: list[StaticPacket],
+    main_index: list[MainIndexEntry],
+) -> list[SleepScoreInfo]:
+    """Extract sleep stage hypnograms from UNKNOWN packets adjacent to SLEEPSCOREINFOGUID.
+
+    Hypnogram data is stored in UNKNOWN static packets immediately following the
+    SLEEPSCOREINFOGUID packet in the static packet table.  There is no fixed GUID
+    for these packets (each scoring session gets a unique UUID), so they are
+    identified by position and by validating the binary format.
+    """
+    sleep_pos: int | None = None
+    for i, pkt in enumerate(static_packets):
+        if pkt.IDStr == "SLEEPSCOREINFOGUID":
+            sleep_pos = i
+            break
+    if sleep_pos is None:
+        return []
+
+    results: list[SleepScoreInfo] = []
+    for dist in range(1, 10):
+        pos = sleep_pos + dist
+        if pos >= len(static_packets):
+            break
+        pkt = static_packets[pos]
+        if pkt.IDStr != "UNKNOWN":
+            break
+        index_entries = _main_index_by_section(main_index, pkt.index)
+        if not index_entries:
+            continue
+        index_entry = index_entries[0]
+        if index_entry.sectionL < 24:
+            continue
+        handle.seek(index_entry.offset, 0)
+        data = handle.read(index_entry.sectionL)
+        score = _try_parse_hypno(data)
+        if score is not None:
+            results.append(score)
+
+    if not results:
+        logger.debug(
+            "SLEEPSCOREINFOGUID present but no complete hypnogram found "
+            "(file may be unscored, a short/test recording, or use an unsupported format)"
+        )
+    else:
+        logger.debug("Found %d hypnogram(s); primary has %d epochs", len(results), len(results[0].epochs))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -2082,6 +2183,7 @@ def read_nervus_header(path: str | Path):
                         target_guids={event.GUID for event in events},
                     )
                     events = normalize_events(events, event_type_info=event_type_info)
+                    sleep_scores = _read_hypnogram(handle, static_packets, main_index)
                     header = NervusHeader(
                         filename=filename,
                         StaticPackets=static_packets,
@@ -2103,6 +2205,7 @@ def read_nervus_header(path: str | Path):
                         MontageInfo=montage_info,
                         MontageInfo2=montage_info2,
                         EventTypeInfo=event_type_info,
+                        SleepScores=sleep_scores,
                         format="nicolet-e",
                     )
                     public_header = _build_public_header(header)
@@ -2143,6 +2246,7 @@ def read_nervus_header(path: str | Path):
             target_guids={event.GUID for event in events},
         )
         events = normalize_events(events, event_type_info=event_type_info)
+        sleep_scores = _read_hypnogram(handle, static_packets, main_index)
 
     nrv_header = NervusHeader(
         filename=filename,
@@ -2165,6 +2269,7 @@ def read_nervus_header(path: str | Path):
         MontageInfo=montage_info,
         MontageInfo2=montage_info2,
         EventTypeInfo=event_type_info,
+        SleepScores=sleep_scores,
         format="nicolet-e",
     )
 

@@ -83,6 +83,24 @@ class EventItem:
 
 
 @dataclass(**DATACLASS_KWARGS)
+class SleepEpoch:
+    """A single scored sleep epoch."""
+
+    stage: int
+    duration: int
+    index: int
+
+
+@dataclass(**DATACLASS_KWARGS)
+class SleepScoreInfo:
+    """A complete hypnogram from one scoring session."""
+
+    algorithm: str
+    epoch_duration: int
+    epochs: list[SleepEpoch]
+
+
+@dataclass(**DATACLASS_KWARGS)
 class NervusHeader:
     """Composite header structure compatible with FieldTrip expectations."""
 
@@ -109,6 +127,7 @@ class NervusHeader:
     MontageInfo: list[dict[str, Any]] = field(default_factory=list)
     MontageInfo2: list[dict[str, Any]] = field(default_factory=list)
     LegacyInfo: dict[str, Any] = field(default_factory=dict)
+    SleepScores: list[SleepScoreInfo] = field(default_factory=list)
     format: str | None = None  # "nicolet-e", "nervus-eeg", etc.
     reference: str | None = None
     targetSamplingRate: float | None = None
